@@ -40,7 +40,7 @@ jobs:
     name: build binaries (x86_64-linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -61,7 +61,7 @@ jobs:
           sha256sum forkd-*.tar.gz > SHA256SUMS
 
       - name: Create / update GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           # Prefer the PAT so the `release: published` event fires
           # downstream workflows (publish-pypi.yml). Fall back to
@@ -80,19 +80,19 @@ jobs:
     name: build + push Docker image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build + push controller image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -123,7 +123,7 @@ jobs:
     # Python SDK publish for `v*` tags on the main package.
     if: startsWith(github.ref_name, 'v')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Dispatch publish-pypi.yml
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
