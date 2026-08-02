@@ -70,7 +70,9 @@ jobs:
           - 'mcp>=1.2,<2'
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9
+      # setup-uv stopped publishing floating major tags after v7, so this
+      # one is pinned to an exact release while the rest track majors.
+      - uses: astral-sh/setup-uv@v9.0.0
       - name: stdio handshake
         run: >-
           uv run --isolated --no-project
