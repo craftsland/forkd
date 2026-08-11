@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "forkd-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "Model Context Protocol server for forkd microVM sandboxes (BRANCH, diff snapshots, prewarm)"
 readme = "README.md"
 authors = [{name = "Deeplethe", email = "info@deeplethe.com"}]
@@ -21,7 +21,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "mcp>=1.0",
+    "mcp>=1.2,<2",
     "httpx>=0.27",
 ]
 

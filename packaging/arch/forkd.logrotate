@@ -1,0 +1,11 @@
+/var/log/forkd/audit.log {
+  weekly
+  rotate 8
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+  su root root
+  create 0600 root root
+}

@@ -140,6 +140,8 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
         prewarm_scratch_dir: cfg.prewarm_scratch_dir.clone(),
         #[cfg(target_os = "linux")]
         live_in_flight: Mutex::new(HashMap::new()),
+        #[cfg(test)]
+        _tempdir: None,
     });
 
     let auth_layer_cfg = auth_cfg.clone();

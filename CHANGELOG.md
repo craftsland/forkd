@@ -6,6 +6,13 @@ Versioning](https://semver.org/spec/v2.0.0.html) once it reaches
 
 ## Unreleased
 
+### MCP compatibility
+
+Constrain `forkd-mcp` to MCP `>=1.2,<2`: its FastMCP import is unavailable
+in older 1.x releases and was removed in MCP 2.x. CI now verifies the stdio
+initialize handshake and all registered tools against MCP 1.2.0 and the
+latest compatible 1.x release. Closes #275.
+
 ## v0.5.3 - 2026-07-22
 
 ### KSM / memfd release catch-up

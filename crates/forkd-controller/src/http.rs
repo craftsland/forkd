@@ -78,6 +78,14 @@ pub struct AppState {
     /// associated snapshot files are unrecoverable.
     #[cfg(target_os = "linux")]
     pub live_in_flight: Mutex<HashMap<String, LiveBranchHandle>>,
+    /// Test-only owner of the scratch `TempDir` backing `snapshot_root`,
+    /// the registry file and `prewarm_scratch_dir`. Tying the directory's
+    /// lifetime to the state means dropping the last `Arc` reaps it; the
+    /// unit tests used to `std::mem::forget` the `TempDir` instead, which
+    /// orphaned one directory per construction on every `cargo test` run
+    /// (issue #273). Declared last so it drops after `registry`.
+    #[cfg(test)]
+    pub _tempdir: Option<tempfile::TempDir>,
 }
 
 /// Phase 6.4: handle for a background bulk-copy thread driving the
@@ -2790,23 +2798,32 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
-    fn test_state() -> SharedState {
+    /// `AppState` on a private scratch `TempDir` that the state itself owns,
+    /// so the directory is reaped when the last `Arc` goes away. Every path
+    /// the daemon writes to — registry file, `snapshot_root`, prewarm
+    /// scratch — lives inside it, so a test run leaves nothing behind in
+    /// `$TMPDIR` (issue #273).
+    fn test_state_with_cap(cap: usize) -> SharedState {
         let td = tempfile::TempDir::new().unwrap();
         let path = td.path().join("state.json");
         let snapshot_root = td.path().join("snapshots");
-        // Leak the TempDir so it survives the test (Drop deletes the dir).
-        std::mem::forget(td);
+        let prewarm_scratch_dir = td.path().join("prewarm");
         Arc::new(AppState {
             registry: Registry::load_or_init(path).unwrap(),
             live_vms: Mutex::new(HashMap::new()),
             snapshot_root,
             branch_in_flight: Mutex::new(HashSet::new()),
-            branch_sem: Arc::new(Semaphore::new(DEFAULT_BRANCH_CONCURRENCY)),
-            branch_concurrency_cap: DEFAULT_BRANCH_CONCURRENCY,
-            prewarm_scratch_dir: std::env::temp_dir().join("forkd-test-prewarm"),
+            branch_sem: Arc::new(Semaphore::new(cap)),
+            branch_concurrency_cap: cap,
+            prewarm_scratch_dir,
             #[cfg(target_os = "linux")]
             live_in_flight: Mutex::new(HashMap::new()),
+            _tempdir: Some(td),
         })
+    }
+
+    fn test_state() -> SharedState {
+        test_state_with_cap(DEFAULT_BRANCH_CONCURRENCY)
     }
 
     #[test]
@@ -3506,21 +3523,7 @@ mod tests {
     #[test]
     fn branch_slot_global_cap_blocks() {
         // Cap = 2 so the test stays deterministic. Reaches the 503 path.
-        let td = tempfile::TempDir::new().unwrap();
-        let path = td.path().join("state.json");
-        let snapshot_root = td.path().join("snapshots");
-        std::mem::forget(td);
-        let s = Arc::new(AppState {
-            registry: Registry::load_or_init(path).unwrap(),
-            live_vms: Mutex::new(HashMap::new()),
-            snapshot_root,
-            branch_in_flight: Mutex::new(HashSet::new()),
-            branch_sem: Arc::new(Semaphore::new(2)),
-            branch_concurrency_cap: 2,
-            prewarm_scratch_dir: std::env::temp_dir().join("forkd-test-prewarm"),
-            #[cfg(target_os = "linux")]
-            live_in_flight: Mutex::new(HashMap::new()),
-        });
+        let s = test_state_with_cap(2);
         let _a = s.try_acquire_branch_slot("t1").unwrap();
         let _b = s.try_acquire_branch_slot("t2").unwrap();
         let err = s
@@ -3531,21 +3534,7 @@ mod tests {
 
     #[test]
     fn branch_slot_capacity_recovers_on_drop() {
-        let td = tempfile::TempDir::new().unwrap();
-        let path = td.path().join("state.json");
-        let snapshot_root = td.path().join("snapshots");
-        std::mem::forget(td);
-        let s = Arc::new(AppState {
-            registry: Registry::load_or_init(path).unwrap(),
-            live_vms: Mutex::new(HashMap::new()),
-            snapshot_root,
-            branch_in_flight: Mutex::new(HashSet::new()),
-            branch_sem: Arc::new(Semaphore::new(1)),
-            branch_concurrency_cap: 1,
-            prewarm_scratch_dir: std::env::temp_dir().join("forkd-test-prewarm"),
-            #[cfg(target_os = "linux")]
-            live_in_flight: Mutex::new(HashMap::new()),
-        });
+        let s = test_state_with_cap(1);
         let a = s.try_acquire_branch_slot("t1").unwrap();
         assert!(s.try_acquire_branch_slot("t2").is_err());
         drop(a);

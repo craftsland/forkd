@@ -9,7 +9,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -28,8 +28,8 @@ jobs:
     # or daemon needed — the analyzer runs on synthetic event lists.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: analyze.py unit tests
@@ -48,8 +48,8 @@ jobs:
     # and the _send wire protocol against an in-process socket server.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: install + pytest
@@ -58,3 +58,26 @@ jobs:
           python -m pip install --quiet pytest
           python -m pip install --quiet -e .
           python -m pytest tests/ -q
+
+  mcp-python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mcp:
+          - 'mcp==1.2.0'
+          # Deliberately tracks the latest compatible 1.x as an early warning.
+          - 'mcp>=1.2,<2'
+    steps:
+      - uses: actions/checkout@v7
+      # setup-uv stopped publishing floating major tags after v7, so this
+      # one is pinned to an exact release while the rest track majors.
+      - uses: astral-sh/setup-uv@v9.0.0
+      - name: stdio handshake
+        run: >-
+          uv run --isolated --no-project
+          --with-editable ./sdk/mcp
+          --with anyio
+          --with pytest
+          --with '${{ matrix.mcp }}'
+          pytest -q sdk/mcp/tests/test_stdio.py
