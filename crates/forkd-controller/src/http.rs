@@ -2518,6 +2518,7 @@ async fn create_workspace(
         created_at_unix: now,
         last_active_unix: now,
         last_branch_memory_path: None,
+        per_child_netns,
     };
     if let Err(e) = s.registry.insert_workspace(ws.clone()) {
         return server_error(&format!("persist workspace: {e:#}"));
@@ -2753,8 +2754,13 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
         .clone()
         .unwrap_or_else(|| ws.source_snapshot_tag.clone());
     let s_clone = s.clone();
+    // Respawn with the same netns layout the workspace was created
+    // with (per_child_netns is persisted on WorkspaceInfo). Hardcoding
+    // false here puts resumed sandboxes on the shared forkd-tap0,
+    // which collides when several workspaces are active.
+    let per_child_netns = ws.per_child_netns;
     let spawn_result = tokio::task::spawn_blocking(move || {
-        spawn_one_for_workspace(&s_clone, &spawn_tag, false, None)
+        spawn_one_for_workspace(&s_clone, &spawn_tag, per_child_netns, None)
     })
     .await;
     let (vm, sb_info) = match spawn_result {

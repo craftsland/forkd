@@ -400,6 +400,12 @@ pub struct WorkspaceInfo {
     /// `suspend?diff=true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_branch_memory_path: Option<std::path::PathBuf>,
+    /// Whether this workspace's live sandboxes use a per-child netns.
+    /// Persisted so that `resume` respawns on the same netns layout
+    /// the workspace was created with (the shared forkd-tap0 is not a
+    /// safe fallback when several workspaces are active).
+    #[serde(default)]
+    pub per_child_netns: bool,
 }
 
 /// `POST /v1/workspaces/:name/suspend` request body.
