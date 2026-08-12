@@ -16,6 +16,13 @@ Actions:
   {"action": "eval", "code": "1 + numpy.zeros(3).sum()"}
     → {"result": "1.0", "exit_code": 0}
 
+  {"action": "stream", "args": ["bash"], "pty": true}
+    → {"stream": "started", "pid": 1234, "pty": true}
+      then {"out": "$ "} chunks as output arrives
+      client sends {"in": "ls\n"} to write to stdin
+      client sends {"action": "stop"} to terminate
+      final message: {"exit_code": 0}
+
 `eval` semantics depend on the recipe. By default the code is evaluated
 as a Python expression against the agent's interpreter (numpy is in
 scope when available). If /etc/forkd-recipe.env declares
@@ -31,6 +38,8 @@ launched as PID 1 by /forkd-init.sh after the kernel finishes mounting
 import itertools
 import json
 import os
+import pty
+import select
 import shlex
 import socket
 import subprocess
@@ -355,6 +364,109 @@ def handle(conn: socket.socket, addr) -> None:
                             "exit_code": 1,
                         },
                     )
+
+        elif action == "stream":
+            args = cmd["args"]
+            cwd = cmd.get("cwd") or None
+            env = _subprocess_env(cmd.get("env"))
+            use_pty = cmd.get("pty", True)
+
+            kwargs = {}
+            if cwd:
+                kwargs["cwd"] = cwd
+            if env:
+                kwargs["env"] = env
+
+            if use_pty:
+                master, slave = pty.openpty()
+                proc = subprocess.Popen(
+                    args,
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    close_fds=True,
+                    **kwargs,
+                )
+                os.close(slave)
+                out_fd = master
+                in_fd = master
+            else:
+                proc = subprocess.Popen(
+                    args,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    **kwargs,
+                )
+                out_fd = proc.stdout.fileno()
+                in_fd = proc.stdin.fileno()
+
+            _send_json(conn, {"stream": "started", "pid": proc.pid, "pty": use_pty})
+
+            # Reader thread: forward process output as JSON chunks.
+            def _stream_reader():
+                try:
+                    while True:
+                        if use_pty:
+                            r, _, _ = select.select([out_fd], [], [], 0.5)
+                            if not r:
+                                if proc.poll() is not None:
+                                    try:
+                                        data = os.read(out_fd, 65536)
+                                        if data:
+                                            _send_json(conn, {"out": data.decode("utf-8", "replace")})
+                                    except OSError:
+                                        pass
+                                    break
+                                continue
+                            data = os.read(out_fd, 65536)
+                        else:
+                            data = proc.stdout.read(65536)
+                        if not data:
+                            break
+                        _send_json(conn, {"out": data.decode("utf-8", "replace")})
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        _send_json(conn, {"exit_code": proc.wait()})
+                    except Exception:
+                        pass
+
+            threading.Thread(target=_stream_reader, daemon=True).start()
+
+            # Main loop: relay stdin lines from the client to the process.
+            try:
+                while True:
+                    line = _recv_line(conn)
+                    if not line:
+                        break
+                    msg = json.loads(line)
+                    action_in = msg.get("action")
+                    if action_in == "stop":
+                        proc.terminate()
+                        break
+                    data = msg.get("in")
+                    if data is not None:
+                        if use_pty:
+                            os.write(in_fd, data.encode("utf-8", "replace"))
+                        else:
+                            proc.stdin.write(data.encode("utf-8", "replace"))
+                            proc.stdin.flush()
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                # Give the reader a moment to flush the exit code.
+                time.sleep(0.2)
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+                return
 
         else:
             _send_json(conn, {"error": f"unknown action: {action}", "exit_code": 1})
