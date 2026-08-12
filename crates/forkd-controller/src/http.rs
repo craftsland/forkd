@@ -61,6 +61,28 @@ pub struct AppState {
     /// of memory.bin; without a cap, an attacker can fill the disk by
     /// firing many BRANCHes in parallel.
     pub branch_sem: Arc<Semaphore>,
+    /// Owner lease for the single shared host tap (`forkd-tap0`),
+    /// enforced by the controller (security review #281).
+    ///
+    /// `forkd-tap0` is a host tap that can be attached by ONE live
+    /// firecracker at a time. A mutex only serialized the restore call —
+    /// it did NOT prevent a second VM from grabbing the tap after the
+    /// first VM was already live (the first VM still holds the tap fd
+    /// for its whole lifetime, so the second spawn would hit "Resource
+    /// busy" even after acquiring the mutex). This lease makes that
+    /// invariant explicit: while a shared-tap VM is live, a second
+    /// shared-tap request is rejected with 503. `per_child_netns=true`
+    /// spawns do NOT touch this (each child netns has its own tap), so
+    /// parallel per-netns sandboxes are unaffected.
+    ///
+    /// `parking_lot::Mutex<Option<String>>` where the value is the owning
+    /// sandbox id. The claim is made INSIDE the `spawn_blocking` task
+    /// (so a cancelled async handler cannot release it mid-restore) and
+    /// committed in the async handler AFTER `live_vms.insert()` (so a
+    /// cancelled handler between restore success and registration does
+    /// not wedge the tap permanently). Released when the VM leaves
+    /// `live_vms` (delete / suspend).
+    pub shared_tap_owner: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
     /// The configured maximum the `branch_sem` was constructed with.
     /// Tracked separately for `/metrics` (`forkd_branch_concurrency_cap`)
     /// because `Semaphore` doesn't expose its initial permit count.
@@ -1135,6 +1157,32 @@ async fn create_sandbox(
     let spawn_live_fork = req.live_fork;
     let spawn_hugepages = req.hugepages;
     let tag_for_work_dir = tag.clone();
+    // Shared-tap lease (review #281): for per_child_netns=false spawns,
+    // claim the shared host tap INSIDE spawn_blocking so handler
+    // cancellation cannot release it mid-restore. The claim is returned
+    // UNCOMMITTED and committed AFTER live_vms.insert() so a cancelled
+    // handler between restore success and registration does not wedge
+    // the tap permanently. The token is the first child's sandbox id;
+    // release_shared_tap_if_owner checks against it on teardown.
+    let use_shared_tap = !req.per_child_netns;
+    let tap_owner_cell = s.shared_tap_owner.clone();
+    let tap_token = if use_shared_tap {
+        Some(new_sandbox_id())
+    } else {
+        None
+    };
+    // Reject shared-TAP batches above n=1 (review #281 round 3): when
+    // per_child_netns=false, all children share a single host tap fd
+    // (forkd-tap0). The tap lease is owned by the first child's sandbox
+    // id; deleting that child releases the lease while sibling VMs
+    // remain live on the same tap fd, causing EBUSY on the next
+    // shared-tap spawn. The common case is n=1; n>1 shared-TAP spawns
+    // are rejected with 503 until per-child tap ownership is modeled.
+    if use_shared_tap && req.n > 1 {
+        return service_unavailable(
+            "shared-TAP spawns with n>1 are not supported; use per_child_netns=true for multi-child spawns",
+        );
+    }
 
     // v0.5 chain resolution. Resolve the chain BEFORE spawn_blocking
     // because it only reads snapshot.json files (cheap). The expensive
@@ -1175,7 +1223,8 @@ async fn create_sandbox(
     let prewarm_requested = req.prewarm;
     let mut snapshot = snapshot;
     let head_tag_for_log = req.snapshot_tag.clone();
-    let (fork_result, mut netns_reservation) = match tokio::task::spawn_blocking(move || -> anyhow::Result<(forkd_vmm::ForkResult, Option<crate::netns::NetnsReservation>)> {
+    let tap_token_for_closure = tap_token.clone();
+    let (fork_result, mut netns_reservation, mut tap_claim) = match tokio::task::spawn_blocking(move || -> anyhow::Result<(forkd_vmm::ForkResult, Option<crate::netns::NetnsReservation>, Option<SharedTapClaim>)> {
         // Reserve the netns offset range INSIDE the blocking task so
         // the reservation survives async-handler cancellation. If
         // the handler is dropped while this task runs, the task still
@@ -1188,6 +1237,23 @@ async fn create_sandbox(
             match netns_alloc.reserve(spawn_n) {
                 Some(r) => Some(r),
                 None => return Err(anyhow::Error::new(NetnsExhausted)),
+            }
+        } else {
+            None
+        };
+        // Claim the shared tap (if this spawn uses it) before restore.
+        // A second live shared-tap VM is rejected with SharedTapBusy ->
+        // 503; the claim is returned UNCOMMITTED and committed by the
+        // async handler after live_vms.insert() so handler cancellation
+        // between restore success and registration does not wedge the
+        // tap permanently (review #281).
+        let tap_claim = if use_shared_tap {
+            match try_claim_shared_tap(
+                &tap_owner_cell,
+                tap_token_for_closure.expect("use_shared_tap => token"),
+            ) {
+                Some(c) => Some(c),
+                None => return Err(anyhow::Error::new(SharedTapBusy)),
             }
         } else {
             None
@@ -1272,7 +1338,7 @@ async fn create_sandbox(
                 std::thread::sleep(std::time::Duration::from_millis(backoffs_ms[attempt - 1]));
             }
             match snapshot.restore_many_with(opts.clone(), &work_dir) {
-                Ok(r) => return Ok((r, netns_reservation)),
+                Ok(r) => return Ok((r, netns_reservation, tap_claim)),
                 Err(e) => {
                     let msg = format!("{e:#}");
                     let is_busy = msg.contains("Resource busy")
@@ -1280,14 +1346,8 @@ async fn create_sandbox(
                         || msg.contains("os error 16");
                     if !is_busy || attempt == backoffs_ms.len() {
                         return Err(e);
+
                     }
-                    tracing::warn!(
-                        attempt = attempt + 1,
-                        next_backoff_ms = backoffs_ms[attempt],
-                        error = %e,
-                        "restore_many: tap/cgroup busy, retrying"
-                    );
-                    last_err = Some(e);
                 }
             }
         }
@@ -1295,8 +1355,11 @@ async fn create_sandbox(
     })
     .await
     {
-        Ok(Ok((fr, nr))) => (fr, nr),
+        Ok(Ok((fr, nr, tc))) => (fr, nr, tc),
         Ok(Err(e)) if e.downcast_ref::<NetnsExhausted>().is_some() => {
+            return service_unavailable(&format!("{e:#}"));
+        }
+        Ok(Err(e)) if e.downcast_ref::<SharedTapBusy>().is_some() => {
             return service_unavailable(&format!("{e:#}"));
         }
         Ok(Err(e)) => return server_error(&format!("restore_many: {e:#}")),
@@ -1315,10 +1378,11 @@ async fn create_sandbox(
 
     let now = unix_now();
     let mut infos = Vec::with_capacity(fork_result.children.len());
+    let mut first_id_override = tap_token.clone();
     {
         let mut live = s.live_vms.lock();
         for vm in fork_result.children {
-            let id = new_sandbox_id();
+            let id = first_id_override.take().unwrap_or_else(new_sandbox_id);
             let info = SandboxInfo {
                 id: id.clone(),
                 snapshot_tag: tag.clone(),
@@ -1347,6 +1411,13 @@ async fn create_sandbox(
         if let Some(res) = netns_reservation.as_mut() {
             res.commit();
         }
+        // Commit the shared-tap lease AFTER live_vms.insert() (review #281):
+        // committing inside spawn_blocking would wedge the tap permanently
+        // if the handler is cancelled between restore success and
+        // registration.
+        if let Some(claim) = tap_claim.as_mut() {
+            claim.commit();
+        }
     }
 
     (StatusCode::CREATED, Json(infos)).into_response()
@@ -1354,13 +1425,16 @@ async fn create_sandbox(
 
 async fn delete_sandbox(State(s): State<SharedState>, Path(id): Path<String>) -> Response {
     // Remove the VM from live_vms, kill firecracker (Vm::drop), then
-    // release the netns index. Killing before releasing closes the
-    // window where a new spawn could enter forkd-child-N while the
-    // previous owner is still dying (review #282).
+    // release the netns index and shared-tap lease. Killing before
+    // releasing closes the window where a new spawn could enter
+    // forkd-child-N or grab forkd-tap0 while the previous owner is
+    // still dying (review #281 & #282).
     let vm = s.live_vms.lock().remove(&id);
     let netns = vm.as_ref().and_then(|v| v.netns.clone());
+    let is_shared_tap = vm.as_ref().map(|v| v.netns.is_none()).unwrap_or(false);
     drop(vm); // kills firecracker + cleans cgroup
     release_netns_index(&s, netns.as_deref());
+    release_shared_tap_if_owner(&s, &id, is_shared_tap);
     let registered = match s.registry.remove_sandbox(&id) {
         Ok(v) => v,
         Err(e) => return server_error(&format!("registry remove: {e}")),
@@ -1398,29 +1472,51 @@ struct VmNetnsGuard {
     vm: Option<forkd_vmm::Vm>,
     netns_index: Option<usize>,
     alloc: std::sync::Arc<crate::netns::NetnsAllocator>,
+    /// Shared-tap cleanup: set when the VM uses the shared host tap
+    /// (netns is None). On Drop, clears the owner if it matches
+    /// `tap_owner_id` (review #281 r3 + #282 r3).
+    shared_tap_owner: Option<std::sync::Arc<parking_lot::Mutex<Option<String>>>>,
+    tap_owner_id: Option<String>,
 }
 
 impl VmNetnsGuard {
-    fn new(vm: forkd_vmm::Vm, alloc: std::sync::Arc<crate::netns::NetnsAllocator>) -> Self {
+    fn new(
+        vm: forkd_vmm::Vm,
+        alloc: std::sync::Arc<crate::netns::NetnsAllocator>,
+        shared_tap_owner: Option<std::sync::Arc<parking_lot::Mutex<Option<String>>>>,
+        tap_owner_id: Option<String>,
+    ) -> Self {
         let netns_index = vm.netns.as_ref().and_then(|ns| {
             ns.strip_prefix("forkd-child-")
                 .and_then(|idx| idx.parse().ok())
         });
+        // Only carry shared-tap cleanup info if the VM actually uses
+        // the shared tap (netns is None) and both the owner cell and
+        // owner id were provided.
+        let uses_shared_tap = vm.netns.is_none();
+        let (shared_tap_owner, tap_owner_id) = if uses_shared_tap {
+            (shared_tap_owner, tap_owner_id)
+        } else {
+            (None, None)
+        };
         Self {
             vm: Some(vm),
             netns_index,
             alloc,
+            shared_tap_owner,
+            tap_owner_id,
         }
     }
 
-    /// Take the VM out of the guard without releasing the netns index.
-    /// Call this when transferring ownership to live_vms (the index
-    /// stays ACTIVE until the VM is later deleted/suspended).
+    /// Take the VM out of the guard without releasing the netns index
+    /// or shared-tap lease. Call this when transferring ownership to
+    /// live_vms (both stay owned until the VM is later deleted/suspended).
     ///
     /// The guard then drops normally — its remaining fields (the
-    /// `Arc<NetnsAllocator>` and bookkeeping strings) are released
-    /// without leaking. `Drop` checks `self.vm.is_some()` so the netns
-    /// index is NOT released when the VM was already taken out here.
+    /// `Arc<NetnsAllocator>`, the shared-tap owner Arc, and bookkeeping
+    /// strings) are released without leaking. `Drop` checks
+    /// `self.vm.is_some()` so the netns index and shared-tap lease are
+    /// NOT released when the VM was already taken out here.
     fn into_vm(mut self) -> forkd_vmm::Vm {
         self.vm.take().expect("guard already consumed")
         // self drops here; Drop sees vm == None and skips kill+release.
@@ -1452,21 +1548,32 @@ impl VmNetnsGuard {
             vm: None,
             netns_index: Some(1),
             alloc,
+            shared_tap_owner: None,
+            tap_owner_id: None,
         }
     }
 }
 
 impl Drop for VmNetnsGuard {
     fn drop(&mut self) {
-        // Only kill the VM and release the netns index when the guard
+        // Only kill the VM and release resources when the guard
         // still owns the VM. If `into_vm()` was called, `self.vm` is
         // `None` — the VM was transferred to `live_vms` and the index
-        // must stay ACTIVE until that VM is later deleted/suspended.
+        // and shared-tap lease must stay owned until that VM is later
+        // deleted/suspended.
         if self.vm.is_some() {
             // Vm::drop kills firecracker + cleans cgroup
             self.vm.take();
+            // Release the netns index after the VM is killed
             if let Some(idx) = self.netns_index {
                 self.alloc.release_index(idx);
+            }
+            // Release the shared-tap lease after the VM is killed
+            if let (Some(cell), Some(id)) = (&self.shared_tap_owner, &self.tap_owner_id) {
+                let mut owner = cell.lock();
+                if owner.as_deref() == Some(id) {
+                    *owner = None;
+                }
             }
         }
         // The Arc<NetnsAllocator> (and other bookkeeping fields) drop
@@ -1628,7 +1735,12 @@ async fn branch_sandbox(
         Some(v) => v,
         None => return not_found(&format!("sandbox {id}")),
     };
-    let vm = VmNetnsGuard::new(vm, s.netns_alloc.clone());
+    let vm = VmNetnsGuard::new(
+        vm,
+        s.netns_alloc.clone(),
+        Some(s.shared_tap_owner.clone()),
+        Some(id.clone()),
+    );
 
     let snap_dir_for_task = snap_dir.clone();
     let id_for_log = id.clone();
@@ -2528,6 +2640,96 @@ impl std::fmt::Display for NetnsExhausted {
 
 impl std::error::Error for NetnsExhausted {}
 
+/// Marker error for "the shared host tap is already owned by a live VM".
+/// Mapped to 503 by callers (vs. generic 500 for other spawn failures).
+#[derive(Debug)]
+struct SharedTapBusy;
+
+impl std::fmt::Display for SharedTapBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shared host tap forkd-tap0 is in use by another live sandbox; \
+             delete it first or use per_child_netns=true for parallel sandboxes"
+        )
+    }
+}
+
+impl std::error::Error for SharedTapBusy {}
+
+/// RAII claim on the single shared host tap (`forkd-tap0`).
+///
+/// Held from inside the `spawn_blocking` restore task until the VM is
+/// registered in `live_vms` (commit) or the spawn fails (drop). Only
+/// used for `per_child_netns=false` spawns; per-netns spawns each have
+/// their own tap and never claim.
+///
+/// Holds an `Arc` to the owner cell so the claim can cross the
+/// `spawn_blocking` boundary and be committed from the async handler
+/// after `live_vms.insert()` — while the blocking restore is still
+/// running, the claim lives inside the blocking task, so cancelling the
+/// async handler cannot release it mid-restore. The commit happens
+/// AFTER registration (review #281: commit-before-registration could
+/// wedge the tap permanently if the handler is cancelled between
+/// restore success and `live_vms.insert`).
+pub struct SharedTapClaim {
+    owner: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
+    token: String,
+    committed: bool,
+}
+
+impl SharedTapClaim {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for SharedTapClaim {
+    fn drop(&mut self) {
+        if !self.committed {
+            let mut owner = self.owner.lock();
+            if owner.as_deref() == Some(self.token.as_str()) {
+                *owner = None;
+            }
+        }
+    }
+}
+
+/// Try to claim the shared host tap. Returns an owner-leased guard, or
+/// `None` when another shared-tap VM is already live (the caller maps
+/// that to a 503). Called from inside `spawn_blocking`.
+fn try_claim_shared_tap(
+    owner_cell: &std::sync::Arc<parking_lot::Mutex<Option<String>>>,
+    token: impl Into<String>,
+) -> Option<SharedTapClaim> {
+    let token = token.into();
+    let mut owner = owner_cell.lock();
+    if owner.is_some() {
+        return None;
+    }
+    *owner = Some(token.clone());
+    Some(SharedTapClaim {
+        owner: std::sync::Arc::clone(owner_cell),
+        token,
+        committed: false,
+    })
+}
+
+/// Release the shared tap lease when a VM leaves `live_vms`. Only
+/// shared-tap VMs (`netns == None`) hold the lease. Checks that the
+/// departing VM's sandbox id matches the stored owner token before
+/// clearing (defense-in-depth: the single-owner invariant should
+/// guarantee this, but the check prevents accidental release if a
+/// future code path inserts a netns=None VM without claiming the lease).
+fn release_shared_tap_if_owner(s: &SharedState, sandbox_id: &str, is_shared_tap: bool) {
+    if is_shared_tap {
+        let mut owner = s.shared_tap_owner.lock();
+        if owner.as_deref() == Some(sandbox_id) {
+            *owner = None;
+        }
+    }
+}
+
 /// Spawn one sandbox from a snapshot tag and return the resulting
 /// `forkd_vmm::Vm` + the daemon-side metadata, without inserting into
 /// the live_vms / Registry. Workspace endpoints insert into those
@@ -2543,6 +2745,7 @@ fn spawn_one_for_workspace(
     forkd_vmm::Vm,
     SandboxInfo,
     Option<crate::netns::NetnsReservation>,
+    Option<SharedTapClaim>,
 )> {
     let snap_dir: PathBuf = match s.registry.get_snapshot(snapshot_tag) {
         Some(s) => PathBuf::from(&s.dir),
@@ -2576,6 +2779,22 @@ fn spawn_one_for_workspace(
         None
     };
     let netns_offset = netns_reservation.as_ref().map(|r| r.offset()).unwrap_or(0);
+    // Generate the sandbox id early so it can serve as the shared-tap
+    // owner token (release_shared_tap_if_owner checks against this id).
+    let sandbox_id = new_sandbox_id();
+    // Shared-tap lease (review #281): claim INSIDE this function (which
+    // runs in spawn_blocking) so handler cancellation cannot release it
+    // mid-restore. The claim is returned uncommitted; the caller commits
+    // it AFTER live_vms.insert() so a cancelled handler between restore
+    // success and registration does not wedge the tap permanently.
+    let tap_claim = if !per_child_netns {
+        match try_claim_shared_tap(&s.shared_tap_owner, &sandbox_id) {
+            Some(c) => Some(c),
+            None => return Err(anyhow::Error::new(SharedTapBusy)),
+        }
+    } else {
+        None
+    };
     let opts = forkd_vmm::ForkOpts {
         n: 1,
         per_child_netns,
@@ -2594,7 +2813,7 @@ fn spawn_one_for_workspace(
         .ok_or_else(|| anyhow::anyhow!("restore_many returned no children"))?;
 
     let info = SandboxInfo {
-        id: new_sandbox_id(),
+        id: sandbox_id,
         snapshot_tag: snapshot_tag.to_string(),
         netns: vm.netns.clone(),
         guest_addr: "10.42.0.2:8888".to_string(),
@@ -2605,7 +2824,7 @@ fn spawn_one_for_workspace(
         last_branch_memory_path: None,
         branch_count: 0,
     };
-    Ok((vm, info, netns_reservation))
+    Ok((vm, info, netns_reservation, tap_claim))
 }
 
 async fn list_workspaces(State(s): State<SharedState>) -> Response {
@@ -2645,9 +2864,12 @@ async fn create_workspace(
     })
     .await;
 
-    let (vm, sb_info, mut netns_reservation) = match spawn_result {
-        Ok(Ok(triple)) => triple,
+    let (vm, sb_info, mut netns_reservation, mut tap_claim) = match spawn_result {
+        Ok(Ok(tuple)) => tuple,
         Ok(Err(e)) if e.downcast_ref::<NetnsExhausted>().is_some() => {
+            return service_unavailable(&format!("{e:#}"));
+        }
+        Ok(Err(e)) if e.downcast_ref::<SharedTapBusy>().is_some() => {
             return service_unavailable(&format!("{e:#}"));
         }
         Ok(Err(e)) => return server_error(&format!("spawn workspace sandbox: {e:#}")),
@@ -2659,11 +2881,17 @@ async fn create_workspace(
         tracing::error!(error=%e, "persist workspace's live sandbox failed");
     }
     s.live_vms.lock().insert(id.clone(), vm);
-    // Registration complete: the netns reservation transfers to live_vms
-    // (security review #282). On spawn failure the reservation is dropped
-    // and released automatically.
+    // Registration complete: commit both reservations AFTER live_vms.insert()
+    // (security review #281 & #282). On spawn failure both are dropped and
+    // released automatically. Committing after registration (not inside
+    // spawn_blocking) ensures a cancelled handler between restore success
+    // and registration does not permanently wedge the tap or leak netns
+    // indices.
     if let Some(res) = netns_reservation.as_mut() {
         res.commit();
+    }
+    if let Some(claim) = tap_claim.as_mut() {
+        claim.commit();
     }
 
     let now = unix_now();
@@ -2693,13 +2921,15 @@ async fn delete_workspace(State(s): State<SharedState>, Path(name): Path<String>
     // Kill the live sandbox if any.
     if let Some(sb_id) = &ws.live_sandbox_id {
         if let Some(vm) = s.live_vms.lock().remove(sb_id) {
-            // Kill firecracker first, then release the netns index,
-            // closing the window where a new spawn could enter
-            // forkd-child-N while the previous owner is still dying
-            // (review #282).
+            // Kill firecracker first, then release the netns index and
+            // shared-tap lease, closing the window where a new spawn
+            // could enter forkd-child-N or grab forkd-tap0 while the
+            // previous owner is still dying (review #281 & #282).
             let netns = vm.netns.clone();
+            let is_shared_tap = netns.is_none();
             drop(vm); // Vm::drop kills firecracker + cleans cgroup
             release_netns_index(&s, netns.as_deref());
+            release_shared_tap_if_owner(&s, sb_id, is_shared_tap);
         }
         let _ = s.registry.remove_sandbox(sb_id);
     }
@@ -2770,7 +3000,12 @@ async fn suspend_workspace(
     };
     // Wrap in VmNetnsGuard so the netns index is released even if the
     // handler is cancelled during the suspend task (review #282 r3).
-    let vm = VmNetnsGuard::new(vm, s.netns_alloc.clone());
+    let vm = VmNetnsGuard::new(
+        vm,
+        s.netns_alloc.clone(),
+        Some(s.shared_tap_owner.clone()),
+        Some(sb_id.clone()),
+    );
     let snap_dir_for_task = snap_dir.clone();
     let source_tag = ws.source_snapshot_tag.clone();
     let source_memory_path = s.snapshot_root.join(&source_tag).join("memory.bin");
@@ -2850,10 +3085,10 @@ async fn suspend_workspace(
     // We took the VM out of live_vms for suspend; intentionally
     // discard it now (suspend == kill source after snapshotting).
     // The guard's Drop kills firecracker and releases the netns index
-    // so the namespace is vacated before the index becomes reusable
-    // (review #282). This also handles handler cancellation: the guard
-    // is dropped when the task's return value is dropped, ensuring the
-    // index is always released (review #282 r3).
+    // and shared-tap lease so the namespace/tap is vacated before they
+    // become reusable (review #281 & #282). This also handles handler
+    // cancellation: the guard is dropped when the task's return value
+    // is dropped, ensuring both are always released (review #282 r3).
     drop(vm_guard);
     let _ = s.registry.remove_sandbox(&sb_id);
 
@@ -2941,9 +3176,12 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
         spawn_one_for_workspace(&s_clone, &spawn_tag, per_child_netns, None)
     })
     .await;
-    let (vm, sb_info, mut netns_reservation) = match spawn_result {
-        Ok(Ok(triple)) => triple,
+    let (vm, sb_info, mut netns_reservation, mut tap_claim) = match spawn_result {
+        Ok(Ok(tuple)) => tuple,
         Ok(Err(e)) if e.downcast_ref::<NetnsExhausted>().is_some() => {
+            return service_unavailable(&format!("{e:#}"));
+        }
+        Ok(Err(e)) if e.downcast_ref::<SharedTapBusy>().is_some() => {
             return service_unavailable(&format!("{e:#}"));
         }
         Ok(Err(e)) => return server_error(&format!("spawn workspace sandbox: {e:#}")),
@@ -2954,15 +3192,18 @@ async fn resume_workspace(State(s): State<SharedState>, Path(name): Path<String>
         tracing::error!(error=%e, "persist workspace's live sandbox failed");
     }
     s.live_vms.lock().insert(id.clone(), vm);
-    // Registration complete: the netns reservation transfers to live_vms
-    // (security review #282). On spawn failure the reservation is dropped
-    // and released automatically.  This mirrors create_workspace — the
+    // Registration complete: commit both reservations AFTER live_vms.insert()
+    // (security review #281 & #282). On spawn failure both are dropped and
+    // released automatically.  This mirrors create_workspace — the
     // previous binding `_netns_reservation` (underscore = unused) dropped
     // the reservation uncommitted, releasing the indices while the
     // resumed VM was still live and re-opening the exact race #282 fixes
     // (review #282 round 2).
     if let Some(res) = netns_reservation.as_mut() {
         res.commit();
+    }
+    if let Some(claim) = tap_claim.as_mut() {
+        claim.commit();
     }
 
     let now = unix_now();
@@ -3010,6 +3251,7 @@ mod tests {
                 256,
                 Box::new(crate::netns::RangeProbe { max: 256 }),
             ),
+            shared_tap_owner: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             prewarm_scratch_dir,
             #[cfg(target_os = "linux")]
             live_in_flight: Mutex::new(HashMap::new()),
@@ -3038,6 +3280,7 @@ mod tests {
                 netns_pool,
                 Box::new(crate::netns::RangeProbe { max: netns_pool }),
             ),
+            shared_tap_owner: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             prewarm_scratch_dir,
             #[cfg(target_os = "linux")]
             live_in_flight: Mutex::new(HashMap::new()),
@@ -3952,6 +4195,110 @@ mod tests {
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
             "resume workspace netns exhaustion must be 503, not a generic 500"
+        );
+    }
+
+    /// Review #281: while a shared-tap VM is live, a second shared-tap
+    /// spawn must be rejected with 503 (not retried into an EBUSY
+    /// loop). The lease claim happens inside the spawn_blocking task,
+    /// before restore, so no firecracker is needed to exercise it.
+    #[tokio::test]
+    async fn create_sandbox_rejects_second_shared_tap_owner_with_503() {
+        let state = test_state();
+        write_base_snapshot(&state, "base");
+        // Simulate an already-live shared-tap VM: the owner lease is held.
+        *state.shared_tap_owner.lock() = Some("sb-live-1".to_string());
+
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"snapshot_tag":"base","n":1,"per_child_netns":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(resp.into_body(), 4096).await.unwrap();
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            err["error"].to_string().contains("forkd-tap0"),
+            "503 should name the shared tap, got: {}",
+            err["error"]
+        );
+        // Lease must still be held by the original owner.
+        assert_eq!(state.shared_tap_owner.lock().as_deref(), Some("sb-live-1"));
+    }
+
+    /// Review #281: per_child_netns=true spawns bypass the shared-tap
+    /// lease entirely (each netns has its own tap), so a per-netns
+    /// request must NOT be rejected when the shared tap is owned.
+    #[tokio::test]
+    async fn create_sandbox_per_netns_ignores_shared_tap_lease() {
+        let state = test_state();
+        write_base_snapshot(&state, "base");
+        *state.shared_tap_owner.lock() = Some("sb-live-1".to_string());
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/sandboxes")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"snapshot_tag":"base","n":1,"per_child_netns":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "per-netns spawn must not hit the shared-tap 503 path"
+        );
+    }
+
+    /// Review #281: lease lifetime semantics — claim blocks a second
+    /// claimer, uncommitted drop (spawn failure) releases, commit
+    /// (successful spawn) keeps the lease until explicit VM teardown.
+    #[test]
+    fn shared_tap_lease_claim_release_and_drop_semantics() {
+        let cell = std::sync::Arc::new(parking_lot::Mutex::new(None::<String>));
+
+        let c1 = try_claim_shared_tap(&cell, "a").expect("first claim wins");
+        assert!(
+            try_claim_shared_tap(&cell, "b").is_none(),
+            "second claim must fail"
+        );
+        assert_eq!(cell.lock().as_deref(), Some("a"));
+
+        // Uncommitted drop (spawn failure path) releases the lease.
+        drop(c1);
+        assert!(cell.lock().is_none(), "drop must release");
+
+        let mut c2 = try_claim_shared_tap(&cell, "c").expect("reclaim after drop");
+        assert_eq!(cell.lock().as_deref(), Some("c"));
+        // Commit (successful spawn) keeps the lease alive past drop.
+        c2.commit();
+        drop(c2);
+        assert_eq!(
+            cell.lock().as_deref(),
+            Some("c"),
+            "committed lease survives guard drop"
+        );
+
+        // Explicit teardown clears the owner cell.
+        *cell.lock() = None;
+        assert!(
+            try_claim_shared_tap(&cell, "d").is_some(),
+            "reclaim after teardown"
         );
     }
 
