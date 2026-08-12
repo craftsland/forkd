@@ -1331,7 +1331,6 @@ async fn create_sandbox(
             snapshot.memory = assembled;
         }
 
-        let mut last_err: Option<anyhow::Error> = None;
         let backoffs_ms = [50u64, 200, 800];
         for attempt in 0..=backoffs_ms.len() {
             if attempt > 0 {
@@ -1351,7 +1350,7 @@ async fn create_sandbox(
                 }
             }
         }
-        Err(last_err.expect("loop must produce an error on exit"))
+        unreachable!("retry loop must return on final attempt")
     })
     .await
     {
