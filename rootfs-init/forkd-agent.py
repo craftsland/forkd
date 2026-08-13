@@ -289,6 +289,37 @@ _start_warmup()
 print("forkd: parent VM ready for snapshot. children inherit this state.", flush=True)
 
 
+class BufferedLineReader:
+    """Persistent buffered line reader for socket connections.
+
+    Unlike _recv_line which discards bytes after the first newline,
+    this class preserves leftover bytes between calls so that coalesced
+    TCP frames (multiple messages in one read) are handled correctly.
+    """
+
+    def __init__(self, conn: socket.socket):
+        self._conn = conn
+        self._buf = bytearray()
+
+    def readline(self) -> bytes:
+        """Read one complete line (terminated by \\n). Returns empty bytes on EOF."""
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl >= 0:
+                line = bytes(self._buf[: nl + 1])
+                del self._buf[: nl + 1]
+                return line
+            chunk = self._conn.recv(4096)
+            if not chunk:
+                # Return any remaining buffered data (partial line without newline)
+                if self._buf:
+                    remaining = bytes(self._buf)
+                    self._buf.clear()
+                    return remaining
+                return b""
+            self._buf.extend(chunk)
+
+
 def _recv_line(conn: socket.socket) -> bytes:
     buf = bytearray()
     while True:
@@ -399,11 +430,21 @@ def handle(conn: socket.socket, addr) -> None:
                     **kwargs,
                 )
                 out_fd = proc.stdout.fileno()
+                err_fd = proc.stderr.fileno()
                 in_fd = proc.stdin.fileno()
 
             _send_json(conn, {"stream": "started", "pid": proc.pid, "pty": use_pty})
 
+            # Event to signal that the reader thread has finished and sent
+            # the exit code. The main loop checks this to break out of
+            # _recv_line when the process exits before the client sends stop.
+            reader_done = threading.Event()
+
             # Reader thread: forward process output as JSON chunks.
+            # In PTY mode, stdout and stderr are multiplexed on the master fd.
+            # In non-PTY mode, stdout and stderr are separate pipes that must
+            # both be drained — a child writing more than the pipe capacity
+            # to stderr would block forever if stderr is never read.
             def _stream_reader():
                 try:
                     while True:
@@ -420,11 +461,34 @@ def handle(conn: socket.socket, addr) -> None:
                                     break
                                 continue
                             data = os.read(out_fd, 65536)
+                            if not data:
+                                break
+                            _send_json(conn, {"out": data.decode("utf-8", "replace")})
                         else:
-                            data = proc.stdout.read(65536)
-                        if not data:
-                            break
-                        _send_json(conn, {"out": data.decode("utf-8", "replace")})
+                            # Non-PTY: multiplex stdout and stderr via select.
+                            readable, _, _ = select.select([out_fd, err_fd], [], [], 0.5)
+                            if not readable:
+                                if proc.poll() is not None:
+                                    # Drain any remaining output.
+                                    for fd, label in [(out_fd, "out"), (err_fd, "err")]:
+                                        try:
+                                            data = os.read(fd, 65536)
+                                            if data:
+                                                _send_json(conn, {label: data.decode("utf-8", "replace")})
+                                        except OSError:
+                                            pass
+                                    break
+                                continue
+                            for fd, label in [(out_fd, "out"), (err_fd, "err")]:
+                                if fd in readable:
+                                    try:
+                                        data = os.read(fd, 65536)
+                                        if not data:
+                                            # EOF on this stream; check if both are done.
+                                            continue
+                                        _send_json(conn, {label: data.decode("utf-8", "replace")})
+                                    except OSError:
+                                        pass
                 except (OSError, ValueError):
                     pass
                 finally:
@@ -432,13 +496,18 @@ def handle(conn: socket.socket, addr) -> None:
                         _send_json(conn, {"exit_code": proc.wait()})
                     except Exception:
                         pass
+                    reader_done.set()
 
-            threading.Thread(target=_stream_reader, daemon=True).start()
+            reader_thread = threading.Thread(target=_stream_reader, daemon=True)
+            reader_thread.start()
 
             # Main loop: relay stdin lines from the client to the process.
+            # Uses a persistent buffered reader so coalesced TCP frames
+            # (multiple messages in one read) are handled correctly.
+            line_reader = BufferedLineReader(conn)
             try:
-                while True:
-                    line = _recv_line(conn)
+                while not reader_done.is_set():
+                    line = line_reader.readline()
                     if not line:
                         break
                     msg = json.loads(line)
@@ -448,11 +517,14 @@ def handle(conn: socket.socket, addr) -> None:
                         break
                     data = msg.get("in")
                     if data is not None:
-                        if use_pty:
-                            os.write(in_fd, data.encode("utf-8", "replace"))
-                        else:
-                            proc.stdin.write(data.encode("utf-8", "replace"))
-                            proc.stdin.flush()
+                        try:
+                            if use_pty:
+                                os.write(in_fd, data.encode("utf-8", "replace"))
+                            else:
+                                proc.stdin.write(data.encode("utf-8", "replace"))
+                                proc.stdin.flush()
+                        except (OSError, BrokenPipeError):
+                            break
             except Exception:
                 pass
             finally:
@@ -460,8 +532,9 @@ def handle(conn: socket.socket, addr) -> None:
                     proc.terminate()
                 except Exception:
                     pass
-                # Give the reader a moment to flush the exit code.
-                time.sleep(0.2)
+                # Wait for the reader thread to finish (with timeout) so the
+                # exit_code message is sent before the socket closes.
+                reader_thread.join(timeout=3)
                 try:
                     proc.wait(timeout=2)
                 except Exception:
