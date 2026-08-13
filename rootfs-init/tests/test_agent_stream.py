@@ -222,7 +222,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
             "pty": False,
         }) + "\n"
         b.sendall(request.encode())
-        b.close()  # Close connection — should trigger shutdown
+        b.shutdown(socket.SHUT_WR)  # Signal EOF — no more input
 
         started, leftover = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
@@ -316,7 +316,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
             "pty": False,
         }) + "\n"
         b.sendall(request.encode())
-        b.close()  # Close immediately after sending request
+        b.shutdown(socket.SHUT_WR)  # Signal EOF
 
         started, leftover = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
