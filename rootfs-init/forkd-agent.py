@@ -328,8 +328,7 @@ class BufferedLineReader:
         never delivered because the socket is not readable after the
         first recv() consumed both messages into the buffer.
         """
-        return self._buf.find(b"
-") >= 0
+        return self._buf.find(b"\n") >= 0
 
     def try_readline(self) -> Optional[bytes]:
         """Return the next complete line from the buffer, or None if
@@ -338,8 +337,7 @@ class BufferedLineReader:
         Unlike readline(), this never blocks on the socket — it only
         returns a line if one is already present in the buffer.
         """
-        nl = self._buf.find(b"
-")
+        nl = self._buf.find(b"\n")
         if nl < 0:
             return None
         line = bytes(self._buf[: nl + 1])
