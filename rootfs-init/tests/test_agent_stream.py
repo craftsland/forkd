@@ -188,7 +188,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
             "pty": False,
         }) + "\n"
         # The input line, appended in the SAME send (coalesced frame)
-        input_msg = json.dumps({"in": "hello-world"}) + "\n"
+        input_msg = json.dumps({"in": "hello-world\n"}) + "\n"
         b.sendall(request.encode() + input_msg.encode())
 
         # Read the "started" message
