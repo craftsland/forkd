@@ -94,9 +94,12 @@ $SUDO du -sh "$WORK"
 # no PATH in /etc/environment and fall back to a default that misses
 # tool-specific directories, causing "command not found" for cargo, go, etc.
 IMAGE_PATH=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
-    | grep '^PATH=' | head -1 | cut -d= -f2- || true)
+    | grep '^PATH=' | tail -1 | cut -d= -f2- || true)
 if [ -n "$IMAGE_PATH" ]; then
     say "    materializing Docker PATH into /etc/environment"
+    # Defense-in-depth: break symlinks before writing (a malicious image
+    # could symlink /etc/environment to a host file).
+    [ -L "$WORK/etc/environment" ] && $SUDO rm -f "$WORK/etc/environment"
     $SUDO touch "$WORK/etc/environment"
     $SUDO sed -i '/^PATH=/d' "$WORK/etc/environment" 2>/dev/null || true
     echo "PATH=$IMAGE_PATH" | $SUDO tee -a "$WORK/etc/environment" >/dev/null

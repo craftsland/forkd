@@ -81,7 +81,7 @@ def _load_container_env(path: str = "/etc/environment") -> dict:
                 if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
                     val = val[1:-1]
                 env[key] = val
-    except FileNotFoundError:
+    except OSError:
         pass
     return env
 
@@ -91,7 +91,7 @@ def _load_container_env(path: str = "/etc/environment") -> dict:
 # container's value.  Callers can still override individual vars per
 # command — see _subprocess_env() below.
 _CONTAINER_ENV = _load_container_env()
-_CONTAINER_PATH = _CONTAINER_ENV.get("PATH", _DEFAULT_PATH)
+_CONTAINER_PATH = _CONTAINER_ENV.get("PATH") or _DEFAULT_PATH
 GUEST_ENV = dict(os.environ)
 GUEST_ENV["PATH"] = _CONTAINER_PATH
 # Carry over any other /etc/environment vars not already in environ.
@@ -100,18 +100,16 @@ for _k, _v in _CONTAINER_ENV.items():
         GUEST_ENV[_k] = _v
 
 
-def _subprocess_env(caller_env: dict | None = None) -> dict | None:
+def _subprocess_env(caller_env: dict | None = None) -> dict:
     """Build the env dict for a subprocess call.
 
     If the caller provides an env, it is merged on top of GUEST_ENV so
     that PATH (and other container defaults) are still present unless
     the caller explicitly overrides them.  If the caller provides
-    nothing, GUEST_ENV is returned as-is.  Returns None only if both
-    GUEST_ENV is empty and caller_env is None (which won't happen in
-    practice — GUEST_ENV always has at least PATH).
+    nothing, a copy of GUEST_ENV is returned.
     """
     if caller_env is None:
-        return GUEST_ENV
+        return dict(GUEST_ENV)
     merged = dict(GUEST_ENV)
     merged.update(caller_env)
     return merged
@@ -204,6 +202,7 @@ def _start_warmup() -> None:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             bufsize=0,
+            env=GUEST_ENV,
         )
     except Exception as e:
         print(f"forkd: failed to spawn warmup: {e}", flush=True)
