@@ -135,6 +135,19 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         b.settimeout(10)
         return a, b
 
+    def _start_handle(self, a):
+        """Start handle() in a daemon thread with socket 'a' as conn.
+
+        The test uses socket 'b' as the client: writes to 'b' are
+        read by handle on 'a', and responses written by handle on 'a'
+        are read by the test on 'b'.
+        """
+        t = threading.Thread(
+            target=self.module.handle, args=(a, ("test",)), daemon=True
+        )
+        t.start()
+        return t
+
     def _read_json_line(self, sock):
         """Read one newline-terminated JSON message from sock."""
         buf = bytearray()
@@ -156,6 +169,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         the BufferedLineReader's buffer and never delivered.
         """
         a, b = self._make_pair()
+        self._start_handle(a)
         # Use 'cat' which echoes stdin to stdout (requires PTY off for
         # line-buffered echo, or the PTY will echo it).
         # We use a shell script that reads a line and prints it with a marker.
@@ -169,7 +183,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         b.sendall(request.encode() + input_msg.encode())
 
         # Read the "started" message
-        started, leftover = self._read_json_line(a)
+        started, leftover = self._read_json_line(b)
         self.assertIsNotNone(started, "Expected 'started' message")
         self.assertEqual(started.get("stream"), "started")
 
@@ -177,7 +191,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         got_input = False
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            msg, leftover = self._read_json_line(a)
+            msg, leftover = self._read_json_line(b)
             if msg is None:
                 break
             if "out" in msg and "GOT:hello-world" in msg["out"]:
@@ -192,6 +206,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         """A stream session that receives no input should exit when the
         process finishes and the connection closes."""
         a, b = self._make_pair()
+        self._start_handle(a)
         request = json.dumps({
             "action": "stream",
             "args": ["sh", "-c", "echo done; exit 0"],
@@ -200,14 +215,14 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         b.sendall(request.encode())
         b.close()  # Close connection — should trigger shutdown
 
-        started, _ = self._read_json_line(a)
+        started, _ = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
 
         # Read until exit_code or timeout
         exit_code = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            msg, _ = self._read_json_line(a)
+            msg, _ = self._read_json_line(b)
             if msg is None:
                 break
             if "exit_code" in msg:
@@ -219,6 +234,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
     def test_stderr_flood_non_pty(self):
         """A child that floods stderr must not deadlock the reader thread."""
         a, b = self._make_pair()
+        self._start_handle(a)
         # Write enough to stderr to exceed pipe capacity (64KB on Linux)
         request = json.dumps({
             "action": "stream",
@@ -227,7 +243,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         }) + "\n"
         b.sendall(request.encode())
 
-        started, _ = self._read_json_line(a)
+        started, _ = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
 
         # Read until we see "done" in stdout or exit_code
@@ -235,7 +251,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         exit_code = None
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            msg, _ = self._read_json_line(a)
+            msg, _ = self._read_json_line(b)
             if msg is None:
                 break
             if "out" in msg and "done" in msg["out"]:
@@ -252,6 +268,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
     def test_stop_terminates_session(self):
         """A 'stop' action should terminate the process."""
         a, b = self._make_pair()
+        self._start_handle(a)
         request = json.dumps({
             "action": "stream",
             "args": ["sh", "-c", "sleep 30; echo never"],
@@ -259,7 +276,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         }) + "\n"
         b.sendall(request.encode())
 
-        started, _ = self._read_json_line(a)
+        started, _ = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
 
         # Send stop
@@ -270,7 +287,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         exit_code = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            msg, _ = self._read_json_line(a)
+            msg, _ = self._read_json_line(b)
             if msg is None:
                 break
             if "exit_code" in msg:
@@ -283,6 +300,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
     def test_connection_close_triggers_cleanup(self):
         """Closing the client socket should trigger process cleanup."""
         a, b = self._make_pair()
+        self._start_handle(a)
         request = json.dumps({
             "action": "stream",
             "args": ["sh", "-c", "sleep 30; echo never"],
@@ -291,7 +309,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         b.sendall(request.encode())
         b.close()  # Close immediately after sending request
 
-        started, _ = self._read_json_line(a)
+        started, _ = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
 
         # The process should be killed; we should get an exit_code
@@ -299,7 +317,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         exit_code = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            msg, _ = self._read_json_line(a)
+            msg, _ = self._read_json_line(b)
             if msg is None:
                 break
             if "exit_code" in msg:
