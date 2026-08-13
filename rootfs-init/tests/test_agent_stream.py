@@ -148,9 +148,18 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         t.start()
         return t
 
-    def _read_json_line(self, sock):
-        """Read one newline-terminated JSON message from sock."""
-        buf = bytearray()
+    def _read_json_line(self, sock, leftover=None):
+        """Read one newline-terminated JSON message from sock.
+
+        Pass leftover bytes from a previous read to handle coalesced
+        TCP frames where multiple messages arrive in one recv().
+        Returns (parsed_json, remaining_leftover_bytes).
+        """
+        buf = bytearray(leftover or b'')
+        # Check if we already have a complete line from the leftover
+        nl = buf.find(b'\n')
+        if nl >= 0:
+            return json.loads(buf[: nl + 1]), bytes(buf[nl + 1 :])
         while True:
             chunk = sock.recv(4096)
             if not chunk:
@@ -159,7 +168,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
             nl = buf.find(b'\n')
             if nl >= 0:
                 return json.loads(buf[: nl + 1]), bytes(buf[nl + 1 :])
-        return None, b''
+        return None, bytes(buf)
 
     def test_coalesced_request_and_input_delivered(self):
         """Request + first input in one send: input must reach the process.
@@ -191,7 +200,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         got_input = False
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            msg, leftover = self._read_json_line(b)
+            msg, leftover = self._read_json_line(b, leftover)
             if msg is None:
                 break
             if "out" in msg and "GOT:hello-world" in msg["out"]:
@@ -215,14 +224,14 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         b.sendall(request.encode())
         b.close()  # Close connection — should trigger shutdown
 
-        started, _ = self._read_json_line(b)
+        started, leftover = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
 
         # Read until exit_code or timeout
         exit_code = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            msg, _ = self._read_json_line(b)
+            msg, leftover = self._read_json_line(b, leftover)
             if msg is None:
                 break
             if "exit_code" in msg:
@@ -243,7 +252,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         }) + "\n"
         b.sendall(request.encode())
 
-        started, _ = self._read_json_line(b)
+        started, leftover = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
 
         # Read until we see "done" in stdout or exit_code
@@ -251,7 +260,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         exit_code = None
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            msg, _ = self._read_json_line(b)
+            msg, leftover = self._read_json_line(b, leftover)
             if msg is None:
                 break
             if "out" in msg and "done" in msg["out"]:
@@ -276,7 +285,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         }) + "\n"
         b.sendall(request.encode())
 
-        started, _ = self._read_json_line(b)
+        started, leftover = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
 
         # Send stop
@@ -287,7 +296,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         exit_code = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            msg, _ = self._read_json_line(b)
+            msg, leftover = self._read_json_line(b, leftover)
             if msg is None:
                 break
             if "exit_code" in msg:
@@ -309,7 +318,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         b.sendall(request.encode())
         b.close()  # Close immediately after sending request
 
-        started, _ = self._read_json_line(b)
+        started, leftover = self._read_json_line(b)
         self.assertEqual(started.get("stream"), "started")
 
         # The process should be killed; we should get an exit_code
@@ -317,7 +326,7 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
         exit_code = None
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            msg, _ = self._read_json_line(b)
+            msg, leftover = self._read_json_line(b, leftover)
             if msg is None:
                 break
             if "exit_code" in msg:
