@@ -47,6 +47,7 @@ import sys
 import threading
 import time
 import traceback
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Container environment
@@ -319,6 +320,32 @@ class BufferedLineReader:
                 return b""
             self._buf.extend(chunk)
 
+    def has_complete_line(self) -> bool:
+        """Return True if the buffer already contains a complete line.
+
+        Used by relay loops to consume buffered lines before selecting
+        the socket — without this, a coalesced request+input frame is
+        never delivered because the socket is not readable after the
+        first recv() consumed both messages into the buffer.
+        """
+        return self._buf.find(b"
+") >= 0
+
+    def try_readline(self) -> Optional[bytes]:
+        """Return the next complete line from the buffer, or None if
+        no complete line is currently buffered (no socket recv performed).
+
+        Unlike readline(), this never blocks on the socket — it only
+        returns a line if one is already present in the buffer.
+        """
+        nl = self._buf.find(b"
+")
+        if nl < 0:
+            return None
+        line = bytes(self._buf[: nl + 1])
+        del self._buf[: nl + 1]
+        return line
+
 
 def _recv_line(conn: socket.socket) -> bytes:
     buf = bytearray()
@@ -523,12 +550,22 @@ def handle(conn: socket.socket, addr) -> None:
             # can interrupt the loop even when the client is idle.
             try:
                 while not reader_done.is_set():
-                    # Wait for socket data with a timeout so we can check
-                    # reader_done periodically without blocking forever.
-                    r, _, _ = select.select([conn], [], [], 0.5)
-                    if not r:
-                        continue  # No data; loop re-checks reader_done.
-                    line = line_reader.readline()
+                    # Consume complete lines already buffered from a
+                    # previous recv() before selecting the socket. If
+                    # the initial request and first input arrived in
+                    # one TCP read, the input is in the buffer but the
+                    # socket is not readable — select would block and
+                    # the buffered input would never be delivered.
+                    if line_reader.has_complete_line():
+                        line = line_reader.try_readline()
+                    else:
+                        # No buffered line — select the socket for the
+                        # next recv, with a timeout so reader_done can
+                        # interrupt the loop.
+                        r, _, _ = select.select([conn], [], [], 0.5)
+                        if not r:
+                            continue  # No data; loop re-checks reader_done.
+                        line = line_reader.readline()
                     if not line:
                         break
                     try:
