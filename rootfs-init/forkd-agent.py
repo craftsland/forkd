@@ -338,7 +338,8 @@ def _send_json(conn: socket.socket, obj) -> None:
 
 def handle(conn: socket.socket, addr) -> None:
     try:
-        line = _recv_line(conn)
+        line_reader = BufferedLineReader(conn)
+        line = line_reader.readline()
         if not line:
             return
         cmd = json.loads(line)
@@ -410,23 +411,30 @@ def handle(conn: socket.socket, addr) -> None:
 
             if use_pty:
                 master, slave = pty.openpty()
-                proc = subprocess.Popen(
-                    args,
-                    stdin=slave,
-                    stdout=slave,
-                    stderr=slave,
-                    close_fds=True,
-                    **kwargs,
-                )
+                try:
+                    proc = subprocess.Popen(
+                        args,
+                        stdin=slave,
+                        stdout=slave,
+                        stderr=slave,
+                        close_fds=True,
+                        **kwargs,
+                    )
+                except Exception:
+                    os.close(master)
+                    os.close(slave)
+                    raise
                 os.close(slave)
                 out_fd = master
                 in_fd = master
+                err_fd = None
             else:
                 proc = subprocess.Popen(
                     args,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
+                    close_fds=True,
                     **kwargs,
                 )
                 out_fd = proc.stdout.fileno()
@@ -436,8 +444,8 @@ def handle(conn: socket.socket, addr) -> None:
             _send_json(conn, {"stream": "started", "pid": proc.pid, "pty": use_pty})
 
             # Event to signal that the reader thread has finished and sent
-            # the exit code. The main loop checks this to break out of
-            # _recv_line when the process exits before the client sends stop.
+            # the exit code. The main loop uses select.select on the socket
+            # with a timeout so it can check reader_done periodically.
             reader_done = threading.Event()
 
             # Reader thread: forward process output as JSON chunks.
@@ -447,48 +455,55 @@ def handle(conn: socket.socket, addr) -> None:
             # to stderr would block forever if stderr is never read.
             def _stream_reader():
                 try:
-                    while True:
-                        if use_pty:
+                    if use_pty:
+                        while True:
                             r, _, _ = select.select([out_fd], [], [], 0.5)
                             if not r:
                                 if proc.poll() is not None:
-                                    try:
-                                        data = os.read(out_fd, 65536)
-                                        if data:
+                                    # Drain any remaining output.
+                                    while True:
+                                        try:
+                                            data = os.read(out_fd, 65536)
+                                            if not data:
+                                                break
                                             _send_json(conn, {"out": data.decode("utf-8", "replace")})
-                                    except OSError:
-                                        pass
+                                        except OSError:
+                                            break
                                     break
                                 continue
-                            data = os.read(out_fd, 65536)
+                            try:
+                                data = os.read(out_fd, 65536)
+                            except OSError:
+                                break
                             if not data:
                                 break
                             _send_json(conn, {"out": data.decode("utf-8", "replace")})
-                        else:
-                            # Non-PTY: multiplex stdout and stderr via select.
-                            readable, _, _ = select.select([out_fd, err_fd], [], [], 0.5)
+                    else:
+                        # Non-PTY: multiplex stdout and stderr via select.
+                        # Track which fds are still open to avoid busy-looping
+                        # on EOF'd pipes (which select reports as readable).
+                        watched = [out_fd, err_fd]
+                        eof_count = 0
+                        while watched:
+                            readable, _, _ = select.select(watched, [], [], 0.5)
                             if not readable:
-                                if proc.poll() is not None:
-                                    # Drain any remaining output.
-                                    for fd, label in [(out_fd, "out"), (err_fd, "err")]:
-                                        try:
-                                            data = os.read(fd, 65536)
-                                            if data:
-                                                _send_json(conn, {label: data.decode("utf-8", "replace")})
-                                        except OSError:
-                                            pass
+                                if proc.poll() is not None and eof_count == len(watched):
                                     break
                                 continue
-                            for fd, label in [(out_fd, "out"), (err_fd, "err")]:
-                                if fd in readable:
-                                    try:
-                                        data = os.read(fd, 65536)
-                                        if not data:
-                                            # EOF on this stream; check if both are done.
-                                            continue
-                                        _send_json(conn, {label: data.decode("utf-8", "replace")})
-                                    except OSError:
-                                        pass
+                            for fd in readable:
+                                try:
+                                    data = os.read(fd, 65536)
+                                except OSError:
+                                    data = b""
+                                if not data:
+                                    # EOF on this stream — remove from watched
+                                    # to prevent busy-looping.
+                                    watched.remove(fd)
+                                    eof_count += 1
+                                    continue
+                                label = "out" if fd == out_fd else "err"
+                                _send_json(conn, {label: data.decode("utf-8", "replace")})
+                        # All streams EOF'd — wait for process to exit.
                 except (OSError, ValueError):
                     pass
                 finally:
@@ -502,28 +517,37 @@ def handle(conn: socket.socket, addr) -> None:
             reader_thread.start()
 
             # Main loop: relay stdin lines from the client to the process.
-            # Uses a persistent buffered reader so coalesced TCP frames
-            # (multiple messages in one read) are handled correctly.
-            line_reader = BufferedLineReader(conn)
+            # Uses the same BufferedLineReader from the initial request so
+            # coalesced TCP frames are handled correctly throughout.
+            # Uses select.select on the socket with a timeout so reader_done
+            # can interrupt the loop even when the client is idle.
             try:
                 while not reader_done.is_set():
+                    # Wait for socket data with a timeout so we can check
+                    # reader_done periodically without blocking forever.
+                    r, _, _ = select.select([conn], [], [], 0.5)
+                    if not r:
+                        continue  # No data; loop re-checks reader_done.
                     line = line_reader.readline()
                     if not line:
                         break
-                    msg = json.loads(line)
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # Skip malformed input, don't kill session.
                     action_in = msg.get("action")
                     if action_in == "stop":
                         proc.terminate()
                         break
                     data = msg.get("in")
-                    if data is not None:
+                    if data is not None and isinstance(data, str):
                         try:
                             if use_pty:
-                                os.write(in_fd, data.encode("utf-8", "replace"))
+                                os.write(in_fd, data.encode("utf-8"))
                             else:
-                                proc.stdin.write(data.encode("utf-8", "replace"))
+                                proc.stdin.write(data.encode("utf-8"))
                                 proc.stdin.flush()
-                        except (OSError, BrokenPipeError):
+                        except (OSError, BrokenPipeError, ValueError):
                             break
             except Exception:
                 pass
@@ -532,6 +556,12 @@ def handle(conn: socket.socket, addr) -> None:
                     proc.terminate()
                 except Exception:
                     pass
+                # Close stdin so processes waiting for EOF can exit gracefully.
+                if not use_pty:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
                 # Wait for the reader thread to finish (with timeout) so the
                 # exit_code message is sent before the socket closes.
                 reader_thread.join(timeout=3)
@@ -539,7 +569,12 @@ def handle(conn: socket.socket, addr) -> None:
                     proc.wait(timeout=2)
                 except Exception:
                     proc.kill()
-                return
+                # Close the PTY master fd to prevent fd leaks.
+                if use_pty:
+                    try:
+                        os.close(out_fd)
+                    except OSError:
+                        pass
 
         else:
             _send_json(conn, {"error": f"unknown action: {action}", "exit_code": 1})
