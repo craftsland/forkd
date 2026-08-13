@@ -85,6 +85,28 @@ mkdir -p "$WORK"
 docker export "$CONTAINER" | $SUDO tar -xf - -C "$WORK"
 $SUDO du -sh "$WORK"
 
+# Materialize the Docker image's Config.Env PATH into /etc/environment.
+# docker export gives us the filesystem contents but NOT the image's
+# configured environment variables.  For images like rust:latest or
+# golang:1.25, tool directories (e.g. /usr/local/cargo/bin,
+# /usr/local/go/bin) exist only in Config.Env, not in /etc/environment.
+# Without this step, the guest agent's _load_container_env() would find
+# no PATH in /etc/environment and fall back to a default that misses
+# tool-specific directories, causing "command not found" for cargo, go, etc.
+IMAGE_PATH=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null \
+    | grep '^PATH=' | tail -1 | cut -d= -f2- || true)
+if [ -n "$IMAGE_PATH" ]; then
+    say "    materializing Docker PATH into /etc/environment"
+    # Defense-in-depth: break symlinks before writing (a malicious image
+    # could symlink /etc/environment to a host file).
+    [ -L "$WORK/etc/environment" ] && $SUDO rm -f "$WORK/etc/environment"
+    $SUDO touch "$WORK/etc/environment"
+    $SUDO sed -i '/^PATH=/d' "$WORK/etc/environment" 2>/dev/null || true
+    echo "PATH=$IMAGE_PATH" | $SUDO tee -a "$WORK/etc/environment" >/dev/null
+else
+    say "    no PATH found in Docker Config.Env, keeping existing /etc/environment"
+fi
+
 # ----------------------------------------------------------------------------
 if [ "${#EXTRA_PKGS[@]}" -gt 0 ]; then
     say "[3/5] chroot apt install: ${EXTRA_PKGS[*]}"
