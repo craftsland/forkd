@@ -1,8 +1,9 @@
 //! In-memory VM registry, snapshotted to a JSON file for crash recovery.
 //!
-//! Concurrency: a single `parking_lot::Mutex` wraps the whole registry.
-//! Writes are infrequent (one per sandbox lifecycle event) so contention
-//! is a non-issue at our scale (≤ a few thousand sandboxes/host).
+//! Concurrency: one `parking_lot::Mutex` wraps the in-memory registry and a
+//! second serializes atomic persistence. Writes are infrequent (one per
+//! sandbox lifecycle event) so contention is a non-issue at our scale
+//! (≤ a few thousand sandboxes/host).
 //!
 //! On startup, the daemon reads `state.json`, then reconciles each entry
 //! against the live system (does the netns still exist, is the FC pid
@@ -34,6 +35,7 @@ pub struct PersistentState {
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<PersistentState>>,
+    persist_lock: Arc<Mutex<()>>,
     path: PathBuf,
 }
 
@@ -54,6 +56,7 @@ impl Registry {
         };
         Ok(Self {
             inner: Arc::new(Mutex::new(state)),
+            persist_lock: Arc::new(Mutex::new(())),
             path,
         })
     }
@@ -198,6 +201,11 @@ impl Registry {
 
     /// Persist current state atomically (write to temp + rename).
     fn flush(&self) -> Result<()> {
+        // Every Registry clone targets the same temp path. Keep snapshot,
+        // write, and rename under one lock so concurrent lifecycle mutations
+        // cannot race the shared state.json.tmp or let an older snapshot
+        // overwrite a newer one.
+        let _persist_guard = self.persist_lock.lock();
         let state = self.inner.lock().clone();
         let tmp = self.path.with_extension("json.tmp");
         let body = serde_json::to_vec_pretty(&state)?;
@@ -281,16 +289,12 @@ fn pid_alive(_pid: u32) -> bool {
 mod tests {
     use super::*;
     use crate::api::SandboxInfo;
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
-    #[test]
-    fn round_trip_persist_load() {
-        let td = TempDir::new().unwrap();
-        let path = td.path().join("state.json");
-
-        let r = Registry::load_or_init(&path).unwrap();
-        r.insert_sandbox(SandboxInfo {
-            id: "sb-1".into(),
+    fn sandbox(id: impl Into<String>) -> SandboxInfo {
+        SandboxInfo {
+            id: id.into(),
             snapshot_tag: "py".into(),
             netns: Some("forkd-child-1".into()),
             guest_addr: "10.42.0.2:8888".into(),
@@ -300,11 +304,55 @@ mod tests {
             has_branched: false,
             last_branch_memory_path: None,
             branch_count: 0,
-        })
-        .unwrap();
+        }
+    }
+
+    #[test]
+    fn round_trip_persist_load() {
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+
+        let r = Registry::load_or_init(&path).unwrap();
+        r.insert_sandbox(sandbox("sb-1")).unwrap();
 
         let r2 = Registry::load_or_init(&path).unwrap();
         assert_eq!(r2.list_sandboxes().len(), 1);
         assert_eq!(r2.list_sandboxes()[0].id, "sb-1");
+    }
+
+    #[test]
+    fn concurrent_mutations_persist_without_tmp_file_races() {
+        const WORKERS: usize = 20;
+        const MUTATIONS_PER_WORKER: usize = 10;
+
+        let td = TempDir::new().unwrap();
+        let path = td.path().join("state.json");
+        let registry = Registry::load_or_init(&path).unwrap();
+        let barrier = Arc::new(Barrier::new(WORKERS));
+
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|worker| {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for mutation in 0..MUTATIONS_PER_WORKER {
+                        registry
+                            .insert_sandbox(sandbox(format!("sb-{worker:02}-{mutation:02}")))?;
+                    }
+                    anyhow::Ok(())
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            worker.join().expect("worker thread panicked").unwrap();
+        }
+
+        let reloaded = Registry::load_or_init(&path).unwrap();
+        assert_eq!(
+            reloaded.list_sandboxes().len(),
+            WORKERS * MUTATIONS_PER_WORKER
+        );
     }
 }
