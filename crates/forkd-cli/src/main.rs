@@ -1815,6 +1815,35 @@ fn images_cmd() -> Result<()> {
     Ok(())
 }
 
+/// Build a deterministic cache filename for a rootfs from the image name,
+/// size, and extra packages. Including size + extras in the key means a
+/// rebuild with different flags does not silently reuse a stale rootfs
+/// (e.g. a too-small default build cached under the same image slug).
+fn rootfs_cache_key(image: &str, size_mib: u32, extra: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let slug: String = image
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let mut hasher = Sha256::new();
+    // Hash the RAW image reference with a length prefix so two distinct
+    // refs that slug to the same filename (e.g. "foo/bar:1" and
+    // "foo-bar-1") cannot collide: the slug is only for readability, the
+    // digest is the collision-proof part of the key.
+    hasher.update((image.len() as u64).to_le_bytes());
+    hasher.update(image.as_bytes());
+    hasher.update(size_mib.to_le_bytes());
+    for pkg in extra {
+        hasher.update(pkg.as_bytes());
+        hasher.update([0]);
+    }
+    let digest = hasher.finalize();
+    let short: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!("{slug}-{size_mib}-{short}.ext4")
+}
+
 fn parent_build_cmd(
     image: String,
     output: Option<PathBuf>,
@@ -2107,15 +2136,11 @@ fn from_image_cmd(
         })?,
     };
 
-    // 2. Materialize rootfs (cached). Same slug rule as forkd run.
+    // 2. Materialize rootfs (cached). The cache key includes the image,
+    //    size, and extra packages so a rebuild with different flags does
+    //    not silently reuse a stale rootfs.
     std::fs::create_dir_all(&cache).ok();
-    let slug: String = image
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    let rootfs = cache.join(format!("{slug}.ext4"));
+    let rootfs = cache.join(rootfs_cache_key(&image, size_mib, &extra));
     if !rootfs.exists() {
         eprintln!("==> building rootfs for {image}");
         parent_build_cmd(image.clone(), Some(rootfs.clone()), size_mib, extra)?;
@@ -2185,15 +2210,9 @@ fn run_cmd(
         );
     }
 
-    // 1. Materialize the rootfs (cached).
+    // 1. Materialize the rootfs (cached). Cache key includes size + extras.
     std::fs::create_dir_all(&cache).ok();
-    let slug: String = image
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    let rootfs = cache.join(format!("{slug}.ext4"));
+    let rootfs = cache.join(rootfs_cache_key(&image, 1536, &extra));
     if !rootfs.exists() {
         eprintln!(
             "==> building rootfs for {image} (cached at {})",
@@ -2205,6 +2224,12 @@ fn run_cmd(
     }
 
     // 2. Snapshot a one-off tag.
+    let slug: String = image
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
     let tag = format!("run-{slug}");
     eprintln!("==> snapshot --tag {tag}");
     snapshot_cmd(
@@ -3431,5 +3456,49 @@ mod tests {
     #[test]
     fn parse_volume_rejects_bad_flag() {
         assert!(parse_volume("/host.img:/guest:wat").is_err());
+    }
+
+    // --- rootfs cache key: size + extras must be part of the key ---
+
+    #[test]
+    fn cache_key_differs_by_size() {
+        let a = rootfs_cache_key("elixir:1.17", 1536, &[]);
+        let b = rootfs_cache_key("elixir:1.17", 3072, &[]);
+        assert_ne!(a, b, "size must be part of the cache key");
+        assert!(a.starts_with("elixir-1-17-1536-"), "got: {a}");
+        assert!(b.starts_with("elixir-1-17-3072-"), "got: {b}");
+    }
+
+    #[test]
+    fn cache_key_differs_by_extra_packages() {
+        let a = rootfs_cache_key("python:3.12-slim", 1536, &[]);
+        let b = rootfs_cache_key("python:3.12-slim", 1536, &["git".to_string()]);
+        assert_ne!(a, b, "extra packages must be part of the cache key");
+    }
+
+    #[test]
+    fn cache_key_is_deterministic() {
+        let a = rootfs_cache_key("elixir:1.17", 3072, &["git".to_string()]);
+        let b = rootfs_cache_key("elixir:1.17", 3072, &["git".to_string()]);
+        assert_eq!(a, b, "same inputs must yield the same key");
+    }
+
+    #[test]
+    fn cache_key_sanitizes_image_slug() {
+        let k = rootfs_cache_key("ghcr.io/foo/bar:1.0", 2048, &[]);
+        assert!(k.starts_with("ghcr-io-foo-bar-1-0-2048-"), "got: {k}");
+    }
+
+    #[test]
+    fn cache_key_differentiates_refs_with_same_slug() {
+        // "foo/bar:1" and "foo-bar-1" both slug to "foo-bar-1"; without
+        // hashing the raw reference this produced IDENTICAL cache keys
+        // (security review #280).
+        let a = rootfs_cache_key("foo/bar:1", 1536, &[]);
+        let b = rootfs_cache_key("foo-bar-1", 1536, &[]);
+        assert_ne!(a, b, "distinct image refs must not collide: {a} vs {b}");
+        // Same reference, same inputs still deterministic.
+        let a2 = rootfs_cache_key("foo/bar:1", 1536, &[]);
+        assert_eq!(a, a2);
     }
 }
