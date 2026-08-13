@@ -41,6 +41,7 @@ import os
 import pty
 import select
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -190,6 +191,41 @@ def _drain_stderr(proc: subprocess.Popen) -> None:
     for raw in iter(proc.stderr.readline, b""):
         sys.stdout.buffer.write(b"forkd-warmup: " + raw)
         sys.stdout.flush()
+
+
+def _kill_process_group(proc: subprocess.Popen, grace: float = 2.0) -> None:
+    """Terminate a stream command and every descendant via its process group.
+
+    Stream commands are spawned with start_new_session=True, which makes
+    the child the leader of a fresh process group (pgid == proc.pid).
+    Signalling the NEGATIVE pgid reaches the shell AND all descendants it
+    spawned, so e.g. `sh -c "sleep 30"` cannot leave `sleep` running after
+    a stop or disconnect.
+    """
+    pgid = proc.pid
+
+    def _group_gone() -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        return False
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if _group_gone():
+                break
+            time.sleep(0.05)
+    # Reap the leader so it doesn't linger as a zombie.
+    try:
+        proc.wait(timeout=1)
+    except Exception:
+        pass
 
 
 def _start_warmup() -> None:
@@ -443,6 +479,7 @@ def handle(conn: socket.socket, addr) -> None:
                         stdout=slave,
                         stderr=slave,
                         close_fds=True,
+                        start_new_session=True,
                         **kwargs,
                     )
                 except Exception:
@@ -460,6 +497,7 @@ def handle(conn: socket.socket, addr) -> None:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     close_fds=True,
+                    start_new_session=True,
                     **kwargs,
                 )
                 out_fd = proc.stdout.fileno()
@@ -572,7 +610,7 @@ def handle(conn: socket.socket, addr) -> None:
                         continue  # Skip malformed input, don't kill session.
                     action_in = msg.get("action")
                     if action_in == "stop":
-                        proc.terminate()
+                        _kill_process_group(proc)
                         break
                     data = msg.get("in")
                     if data is not None and isinstance(data, str):
@@ -587,10 +625,9 @@ def handle(conn: socket.socket, addr) -> None:
             except Exception:
                 pass
             finally:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                # Terminate the WHOLE process group (shell + descendants),
+                # not just the direct child.
+                _kill_process_group(proc)
                 # Close stdin so processes waiting for EOF can exit gracefully.
                 if not use_pty:
                     try:
@@ -600,10 +637,6 @@ def handle(conn: socket.socket, addr) -> None:
                 # Wait for the reader thread to finish (with timeout) so the
                 # exit_code message is sent before the socket closes.
                 reader_thread.join(timeout=3)
-                try:
-                    proc.wait(timeout=2)
-                except Exception:
-                    proc.kill()
                 # Close the PTY master fd to prevent fd leaks.
                 if use_pty:
                     try:

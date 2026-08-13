@@ -17,6 +17,7 @@ Or:      python3 rootfs-init/tests/test_agent_stream.py
 import importlib.util
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -57,6 +58,17 @@ def _load_agent_module():
     finally:
         os.environ.clear()
         os.environ.update(orig_env)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True if the given PID is still alive (signal 0 probe)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class TestBufferedLineReaderCoalesced(unittest.TestCase):
@@ -333,6 +345,107 @@ class TestHandleStreamCoalescedFrame(unittest.TestCase):
                 exit_code = msg["exit_code"]
                 break
         # Either we got exit_code or the socket closed (both indicate cleanup)
+        a.close()
+
+    def test_stop_kills_descendants(self):
+        """A 'stop' action must kill descendant processes, not just the shell.
+
+        Regression: the stream command runs through a shell; cleanup that
+        only signals the shell leaves its children (e.g. `sleep`) running.
+        The command is started in its own process group
+        (start_new_session=True), so stop must TERM/KILL the whole group.
+        """
+        a, b = self._make_pair()
+        self._start_handle(a)
+        # Spawn `sleep 30` as a background child, print its PID to stderr
+        # (unbuffered) so the test can capture it, then `wait` so the shell
+        # stays alive holding the child.
+        request = json.dumps({
+            "action": "stream",
+            "args": ["sh", "-c", "sleep 30 & echo CHILD:$! >&2; wait"],
+            "pty": False,
+        }) + "\n"
+        b.sendall(request.encode())
+
+        started, leftover = self._read_json_line(b)
+        self.assertEqual(started.get("stream"), "started")
+
+        child_pid = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            msg, leftover = self._read_json_line(b, leftover)
+            if msg is None:
+                break
+            if "err" in msg and "CHILD:" in msg["err"]:
+                m = re.search(r"CHILD:(\d+)", msg["err"])
+                if m:
+                    child_pid = int(m.group(1))
+                    break
+            if "exit_code" in msg:
+                break
+        self.assertIsNotNone(child_pid, "did not capture the descendant PID")
+        self.assertTrue(_pid_alive(child_pid), "descendant should be alive before stop")
+
+        b.sendall(json.dumps({"action": "stop"}).encode() + b"\n")
+
+        exit_code = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            msg, leftover = self._read_json_line(b, leftover)
+            if msg is None:
+                break
+            if "exit_code" in msg:
+                exit_code = msg["exit_code"]
+                break
+        self.assertIsNotNone(exit_code, "no exit_code after stop")
+
+        # The descendant must be gone — the group kill reaches it directly.
+        deadline = time.monotonic() + 5
+        while _pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive(child_pid), "descendant (sleep) survived stop")
+        a.close()
+        b.close()
+
+    def test_connection_close_kills_descendants(self):
+        """Disconnect must kill descendants, not just the shell."""
+        a, b = self._make_pair()
+        self._start_handle(a)
+        request = json.dumps({
+            "action": "stream",
+            "args": ["sh", "-c", "sleep 30 & echo CHILD:$! >&2; wait"],
+            "pty": False,
+        }) + "\n"
+        b.sendall(request.encode())
+
+        started, leftover = self._read_json_line(b)
+        self.assertEqual(started.get("stream"), "started")
+
+        # Capture the descendant PID FIRST, while the main loop is still
+        # waiting for input (the socket is not yet closed).
+        child_pid = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            msg, leftover = self._read_json_line(b, leftover)
+            if msg is None:
+                break
+            if "err" in msg and "CHILD:" in msg["err"]:
+                m = re.search(r"CHILD:(\d+)", msg["err"])
+                if m:
+                    child_pid = int(m.group(1))
+                    break
+            if "exit_code" in msg:
+                break
+        self.assertIsNotNone(child_pid, "did not capture the descendant PID")
+        self.assertTrue(_pid_alive(child_pid), "descendant should be alive before disconnect")
+
+        # Now disconnect — the cleanup path must kill the whole group.
+        b.shutdown(socket.SHUT_WR)
+
+        deadline = time.monotonic() + 5
+        while _pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertFalse(_pid_alive(child_pid), "descendant (sleep) survived disconnect")
         a.close()
 
 
