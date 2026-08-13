@@ -2034,7 +2034,7 @@ fn quickstart_cmd(n: usize, image: String, yes: bool) -> Result<()> {
             image,
             tag.clone(),
             vec![],
-            1536,
+            DEFAULT_ROOTFS_SIZE_MIB,
             PathBuf::from("/var/cache/forkd"),
             None,
             "forkd-tap0".to_string(),
@@ -2219,14 +2219,18 @@ fn run_cmd(
     }
 
     // 1. Materialize the rootfs (cached). Cache key includes size + extras.
+    // Resolve the size ONCE so the cache key and the builder always agree.
+    // (Previously the key used the 24576 default while the builder hard-coded
+    // 1536, caching an undersized rootfs under a full-size key.)
     std::fs::create_dir_all(&cache).ok();
-    let rootfs = cache.join(rootfs_cache_key(&image, DEFAULT_ROOTFS_SIZE_MIB, &extra));
+    let size_mib = DEFAULT_ROOTFS_SIZE_MIB;
+    let rootfs = cache.join(rootfs_cache_key(&image, size_mib, &extra));
     if !rootfs.exists() {
         eprintln!(
             "==> building rootfs for {image} (cached at {})",
             rootfs.display()
         );
-        parent_build_cmd(image.clone(), Some(rootfs.clone()), 1536, extra)?;
+        parent_build_cmd(image.clone(), Some(rootfs.clone()), size_mib, extra)?;
     } else {
         eprintln!("==> using cached rootfs {}", rootfs.display());
     }
@@ -3495,6 +3499,23 @@ mod tests {
     fn cache_key_sanitizes_image_slug() {
         let k = rootfs_cache_key("ghcr.io/foo/bar:1.0", 2048, &[]);
         assert!(k.starts_with("ghcr-io-foo-bar-1-0-2048-"), "got: {k}");
+    }
+
+    #[test]
+    fn run_default_cache_key_uses_default_size_not_legacy_1536() {
+        // Regression guard: the run path must build and cache at the SAME
+        // resolved size. Previously run_cmd used the 24576 default in the
+        // cache key but hard-coded 1536 in the builder call, so an
+        // undersized rootfs was cached under a full-size key.
+        let key = rootfs_cache_key("python:3.12-slim", DEFAULT_ROOTFS_SIZE_MIB, &[]);
+        assert!(
+            key.contains(&DEFAULT_ROOTFS_SIZE_MIB.to_string()),
+            "run default cache key must embed {DEFAULT_ROOTFS_SIZE_MIB}, got: {key}"
+        );
+        assert!(
+            !key.contains("1536"),
+            "run default cache key must not use the legacy 1536 size, got: {key}"
+        );
     }
 
     #[test]
