@@ -16,6 +16,13 @@ Actions:
   {"action": "eval", "code": "1 + numpy.zeros(3).sum()"}
     → {"result": "1.0", "exit_code": 0}
 
+  {"action": "stream", "args": ["bash"], "pty": true}
+    → {"stream": "started", "pid": 1234, "pty": true}
+      then {"out": "$ "} chunks as output arrives
+      client sends {"in": "ls\n"} to write to stdin
+      client sends {"action": "stop"} to terminate
+      final message: {"exit_code": 0}
+
 `eval` semantics depend on the recipe. By default the code is evaluated
 as a Python expression against the agent's interpreter (numpy is in
 scope when available). If /etc/forkd-recipe.env declares
@@ -31,13 +38,17 @@ launched as PID 1 by /forkd-init.sh after the kernel finishes mounting
 import itertools
 import json
 import os
+import pty
+import select
 import shlex
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
 import traceback
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Container environment
@@ -182,6 +193,41 @@ def _drain_stderr(proc: subprocess.Popen) -> None:
         sys.stdout.flush()
 
 
+def _kill_process_group(proc: subprocess.Popen, grace: float = 2.0) -> None:
+    """Terminate a stream command and every descendant via its process group.
+
+    Stream commands are spawned with start_new_session=True, which makes
+    the child the leader of a fresh process group (pgid == proc.pid).
+    Signalling the NEGATIVE pgid reaches the shell AND all descendants it
+    spawned, so e.g. `sh -c "sleep 30"` cannot leave `sleep` running after
+    a stop or disconnect.
+    """
+    pgid = proc.pid
+
+    def _group_gone() -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        return False
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            break
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if _group_gone():
+                break
+            time.sleep(0.05)
+    # Reap the leader so it doesn't linger as a zombie.
+    try:
+        proc.wait(timeout=1)
+    except Exception:
+        pass
+
+
 def _start_warmup() -> None:
     """If FORKD_WARMUP_CMD is set, spawn it and wait for the ready handshake.
 
@@ -280,6 +326,61 @@ _start_warmup()
 print("forkd: parent VM ready for snapshot. children inherit this state.", flush=True)
 
 
+class BufferedLineReader:
+    """Persistent buffered line reader for socket connections.
+
+    Unlike _recv_line which discards bytes after the first newline,
+    this class preserves leftover bytes between calls so that coalesced
+    TCP frames (multiple messages in one read) are handled correctly.
+    """
+
+    def __init__(self, conn: socket.socket):
+        self._conn = conn
+        self._buf = bytearray()
+
+    def readline(self) -> bytes:
+        """Read one complete line (terminated by \\n). Returns empty bytes on EOF."""
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl >= 0:
+                line = bytes(self._buf[: nl + 1])
+                del self._buf[: nl + 1]
+                return line
+            chunk = self._conn.recv(4096)
+            if not chunk:
+                # Return any remaining buffered data (partial line without newline)
+                if self._buf:
+                    remaining = bytes(self._buf)
+                    self._buf.clear()
+                    return remaining
+                return b""
+            self._buf.extend(chunk)
+
+    def has_complete_line(self) -> bool:
+        """Return True if the buffer already contains a complete line.
+
+        Used by relay loops to consume buffered lines before selecting
+        the socket — without this, a coalesced request+input frame is
+        never delivered because the socket is not readable after the
+        first recv() consumed both messages into the buffer.
+        """
+        return self._buf.find(b"\n") >= 0
+
+    def try_readline(self) -> Optional[bytes]:
+        """Return the next complete line from the buffer, or None if
+        no complete line is currently buffered (no socket recv performed).
+
+        Unlike readline(), this never blocks on the socket — it only
+        returns a line if one is already present in the buffer.
+        """
+        nl = self._buf.find(b"\n")
+        if nl < 0:
+            return None
+        line = bytes(self._buf[: nl + 1])
+        del self._buf[: nl + 1]
+        return line
+
+
 def _recv_line(conn: socket.socket) -> bytes:
     buf = bytearray()
     while True:
@@ -298,7 +399,8 @@ def _send_json(conn: socket.socket, obj) -> None:
 
 def handle(conn: socket.socket, addr) -> None:
     try:
-        line = _recv_line(conn)
+        line_reader = BufferedLineReader(conn)
+        line = line_reader.readline()
         if not line:
             return
         cmd = json.loads(line)
@@ -355,6 +457,192 @@ def handle(conn: socket.socket, addr) -> None:
                             "exit_code": 1,
                         },
                     )
+
+        elif action == "stream":
+            args = cmd["args"]
+            cwd = cmd.get("cwd") or None
+            env = _subprocess_env(cmd.get("env"))
+            use_pty = cmd.get("pty", True)
+
+            kwargs = {}
+            if cwd:
+                kwargs["cwd"] = cwd
+            if env:
+                kwargs["env"] = env
+
+            if use_pty:
+                master, slave = pty.openpty()
+                try:
+                    proc = subprocess.Popen(
+                        args,
+                        stdin=slave,
+                        stdout=slave,
+                        stderr=slave,
+                        close_fds=True,
+                        start_new_session=True,
+                        **kwargs,
+                    )
+                except Exception:
+                    os.close(master)
+                    os.close(slave)
+                    raise
+                os.close(slave)
+                out_fd = master
+                in_fd = master
+                err_fd = None
+            else:
+                proc = subprocess.Popen(
+                    args,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    close_fds=True,
+                    start_new_session=True,
+                    **kwargs,
+                )
+                out_fd = proc.stdout.fileno()
+                err_fd = proc.stderr.fileno()
+                in_fd = proc.stdin.fileno()
+
+            _send_json(conn, {"stream": "started", "pid": proc.pid, "pty": use_pty})
+
+            # Event to signal that the reader thread has finished and sent
+            # the exit code. The main loop uses select.select on the socket
+            # with a timeout so it can check reader_done periodically.
+            reader_done = threading.Event()
+
+            # Reader thread: forward process output as JSON chunks.
+            # In PTY mode, stdout and stderr are multiplexed on the master fd.
+            # In non-PTY mode, stdout and stderr are separate pipes that must
+            # both be drained — a child writing more than the pipe capacity
+            # to stderr would block forever if stderr is never read.
+            def _stream_reader():
+                try:
+                    if use_pty:
+                        while True:
+                            r, _, _ = select.select([out_fd], [], [], 0.5)
+                            if not r:
+                                if proc.poll() is not None:
+                                    # Drain any remaining output.
+                                    while True:
+                                        try:
+                                            data = os.read(out_fd, 65536)
+                                            if not data:
+                                                break
+                                            _send_json(conn, {"out": data.decode("utf-8", "replace")})
+                                        except OSError:
+                                            break
+                                    break
+                                continue
+                            try:
+                                data = os.read(out_fd, 65536)
+                            except OSError:
+                                break
+                            if not data:
+                                break
+                            _send_json(conn, {"out": data.decode("utf-8", "replace")})
+                    else:
+                        # Non-PTY: multiplex stdout and stderr via select.
+                        # Track which fds are still open to avoid busy-looping
+                        # on EOF'd pipes (which select reports as readable).
+                        watched = [out_fd, err_fd]
+                        eof_count = 0
+                        while watched:
+                            readable, _, _ = select.select(watched, [], [], 0.5)
+                            if not readable:
+                                if proc.poll() is not None and eof_count == len(watched):
+                                    break
+                                continue
+                            for fd in readable:
+                                try:
+                                    data = os.read(fd, 65536)
+                                except OSError:
+                                    data = b""
+                                if not data:
+                                    # EOF on this stream — remove from watched
+                                    # to prevent busy-looping.
+                                    watched.remove(fd)
+                                    eof_count += 1
+                                    continue
+                                label = "out" if fd == out_fd else "err"
+                                _send_json(conn, {label: data.decode("utf-8", "replace")})
+                        # All streams EOF'd — wait for process to exit.
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        _send_json(conn, {"exit_code": proc.wait()})
+                    except Exception:
+                        pass
+                    reader_done.set()
+
+            reader_thread = threading.Thread(target=_stream_reader, daemon=True)
+            reader_thread.start()
+
+            # Main loop: relay stdin lines from the client to the process.
+            # Uses the same BufferedLineReader from the initial request so
+            # coalesced TCP frames are handled correctly throughout.
+            # Uses select.select on the socket with a timeout so reader_done
+            # can interrupt the loop even when the client is idle.
+            try:
+                while not reader_done.is_set():
+                    # Consume complete lines already buffered from a
+                    # previous recv() before selecting the socket. If
+                    # the initial request and first input arrived in
+                    # one TCP read, the input is in the buffer but the
+                    # socket is not readable — select would block and
+                    # the buffered input would never be delivered.
+                    if line_reader.has_complete_line():
+                        line = line_reader.try_readline()
+                    else:
+                        # No buffered line — select the socket for the
+                        # next recv, with a timeout so reader_done can
+                        # interrupt the loop.
+                        r, _, _ = select.select([conn], [], [], 0.5)
+                        if not r:
+                            continue  # No data; loop re-checks reader_done.
+                        line = line_reader.readline()
+                    if not line:
+                        break
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # Skip malformed input, don't kill session.
+                    action_in = msg.get("action")
+                    if action_in == "stop":
+                        _kill_process_group(proc)
+                        break
+                    data = msg.get("in")
+                    if data is not None and isinstance(data, str):
+                        try:
+                            if use_pty:
+                                os.write(in_fd, data.encode("utf-8"))
+                            else:
+                                proc.stdin.write(data.encode("utf-8"))
+                                proc.stdin.flush()
+                        except (OSError, BrokenPipeError, ValueError):
+                            break
+            except Exception:
+                pass
+            finally:
+                # Terminate the WHOLE process group (shell + descendants),
+                # not just the direct child.
+                _kill_process_group(proc)
+                # Close stdin so processes waiting for EOF can exit gracefully.
+                if not use_pty:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                # Wait for the reader thread to finish (with timeout) so the
+                # exit_code message is sent before the socket closes.
+                reader_thread.join(timeout=3)
+                # Close the PTY master fd to prevent fd leaks.
+                if use_pty:
+                    try:
+                        os.close(out_fd)
+                    except OSError:
+                        pass
 
         else:
             _send_json(conn, {"error": f"unknown action: {action}", "exit_code": 1})

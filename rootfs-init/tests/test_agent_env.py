@@ -167,5 +167,74 @@ class TestSubprocessEnv(unittest.TestCase):
         self.assertIn('CARGO_HOME', result)
 
 
+
+class FakeSocket:
+    """Fake socket that returns pre-loaded data sequentially."""
+    def __init__(self, *chunks):
+        self._data = b"".join(chunks)
+        self._pos = 0
+
+    def recv(self, size):
+        if self._pos >= len(self._data):
+            return b""
+        chunk = self._data[self._pos:self._pos + size]
+        self._pos += len(chunk)
+        return chunk
+
+
+class TestBufferedLineReader(unittest.TestCase):
+    """Test BufferedLineReader for coalesced TCP frame handling."""
+
+    def setUp(self):
+        self.module, self.env_path = _load_agent_module()
+        self.BLR = self.module.BufferedLineReader
+
+    def tearDown(self):
+        os.unlink(self.env_path)
+
+    def test_single_line(self):
+        sock = FakeSocket(b'{"action":"ping"}\n')
+        reader = self.BLR(sock)
+        self.assertEqual(reader.readline(), b'{"action":"ping"}\n')
+
+    def test_coalesced_frames(self):
+        """Two messages in one TCP read are both returned correctly."""
+        sock = FakeSocket(b'msg1\nmsg2\n')
+        reader = self.BLR(sock)
+        self.assertEqual(reader.readline(), b'msg1\n')
+        self.assertEqual(reader.readline(), b'msg2\n')
+
+    def test_partial_line_across_reads(self):
+        """A line split across multiple recv calls is assembled correctly."""
+        sock = FakeSocket(b'par', b'tial', b'\n')
+        reader = self.BLR(sock)
+        self.assertEqual(reader.readline(), b'partial\n')
+
+    def test_eof_returns_empty(self):
+        sock = FakeSocket(b'')
+        reader = self.BLR(sock)
+        self.assertEqual(reader.readline(), b'')
+
+    def test_eof_with_partial_line(self):
+        """EOF with partial line (no newline) returns the remaining bytes."""
+        sock = FakeSocket(b'partial')
+        reader = self.BLR(sock)
+        self.assertEqual(reader.readline(), b'partial')
+
+    def test_multiple_lines_one_read(self):
+        """Multiple lines in a single recv are returned one at a time."""
+        sock = FakeSocket(b'line1\nline2\nline3\n')
+        reader = self.BLR(sock)
+        self.assertEqual(reader.readline(), b'line1\n')
+        self.assertEqual(reader.readline(), b'line2\n')
+        self.assertEqual(reader.readline(), b'line3\n')
+
+    def test_interleaved_reads(self):
+        """Coalesced frames split across recv boundaries work correctly."""
+        sock = FakeSocket(b'msg1\nmsg', b'2\nmsg3\n')
+        reader = self.BLR(sock)
+        self.assertEqual(reader.readline(), b'msg1\n')
+        self.assertEqual(reader.readline(), b'msg2\n')
+        self.assertEqual(reader.readline(), b'msg3\n')
 if __name__ == '__main__':
     unittest.main(verbosity=2)
