@@ -43,6 +43,23 @@ jobs:
       - name: run.sh shellcheck-style parse
         run: bash -n bench/pause-window/run.sh
 
+  agent-python:
+    # forkd-agent.py unit + stream tests. forkd-agent runs as PID 1 inside
+    # guest VMs; these exercise the pure-Python protocol logic (container-env
+    # PATH handling, BufferedLineReader coalesced-frame handling, stream
+    # lifecycle + process-group descendant cleanup) with no VM/firecracker.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: agent env + stream tests
+        working-directory: rootfs-init
+        run: |
+          python tests/test_agent_env.py
+          python tests/test_agent_stream.py
+
   sdk-python:
     # SDK unit tests that need no firecracker/daemon — target parsing
     # and the _send wire protocol against an in-process socket server.
