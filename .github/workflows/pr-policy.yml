@@ -1,0 +1,30 @@
+name: pr-policy
+
+# Daily development lands on dev. The main branch is promoted only from the
+# repository's dev branch so a release candidate has one auditable lineage.
+# pull_request_target is intentional here: this policy must come from the
+# protected base branch, not from contributor-controlled PR contents. The job
+# never checks out or executes code from the pull request.
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  main-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the repository dev branch
+        env:
+          BASE_REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if [[ "${HEAD_REPOSITORY}" != "${BASE_REPOSITORY}" || "${HEAD_BRANCH}" != "dev" ]]; then
+            echo "::error::Pull requests to main must come from ${BASE_REPOSITORY}:dev."
+            echo "::error::Retarget normal feature and fix pull requests to dev."
+            exit 1
+          fi
