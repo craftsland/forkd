@@ -276,3 +276,54 @@ async fn end_to_end_audit_log_records_request() {
     }
     panic!("audit log never captured /version request");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn end_to_end_sighup_reopens_rotated_audit_log() {
+    let d = TestDaemon::start().await;
+    let audit = d._td.path().join("audit.log");
+    let rotated = d._td.path().join("audit.log.1");
+
+    let _ = reqwest::get(format!("{}/version", d.base)).await.unwrap();
+    for _ in 0..50 {
+        if std::fs::read_to_string(&audit).is_ok_and(|contents| contents.contains("\"/version\"")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(std::fs::read_to_string(&audit)
+        .unwrap()
+        .contains("\"/version\""));
+
+    std::fs::rename(&audit, &rotated).unwrap();
+    let signal_result = unsafe { libc::kill(libc::getpid(), libc::SIGHUP) };
+    assert_eq!(
+        signal_result,
+        0,
+        "send SIGHUP: {}",
+        std::io::Error::last_os_error()
+    );
+
+    for _ in 0..50 {
+        if audit.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(audit.exists(), "SIGHUP did not recreate the audit log path");
+
+    let _ = reqwest::get(format!("{}/metrics", d.base)).await.unwrap();
+    for _ in 0..50 {
+        if std::fs::read_to_string(&audit).is_ok_and(|contents| contents.contains("\"/metrics\"")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let old_contents = std::fs::read_to_string(rotated).unwrap();
+    let new_contents = std::fs::read_to_string(audit).unwrap();
+    assert!(old_contents.contains("\"/version\""));
+    assert!(!old_contents.contains("\"/metrics\""));
+    assert!(new_contents.contains("\"event\":\"log_reopened\""));
+    assert!(new_contents.contains("\"/metrics\""));
+}

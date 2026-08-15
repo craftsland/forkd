@@ -6,6 +6,14 @@ Versioning](https://semver.org/spec/v2.0.0.html) once it reaches
 
 ## Unreleased
 
+### Audit-log rotation
+
+The controller now reopens its audit log on `SIGHUP`, with reopen and request
+writes serialized under the same writer lock so rotation does not drop or
+split records. A successful reopen emits a `log_reopened` audit event. The
+systemd unit exposes `systemctl reload`, and the packaged logrotate policy
+uses rename/create plus reload instead of `copytruncate`. Closes #278.
+
 ### MCP compatibility
 
 Constrain `forkd-mcp` to MCP `>=1.2,<2`: its FastMCP import is unavailable

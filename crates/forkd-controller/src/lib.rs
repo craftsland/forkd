@@ -81,7 +81,8 @@ fn unauthenticated_non_loopback(bind: SocketAddr, token_file: Option<&Path>) -> 
 }
 
 /// Bring up the controller daemon. Blocks until the listener exits.
-/// SIGTERM and SIGINT trigger a graceful shutdown.
+/// SIGTERM and SIGINT trigger a graceful shutdown; SIGHUP reopens the
+/// configured audit log after external rotation.
 pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
     let registry = Registry::load_or_init(&cfg.state_file)
         .with_context(|| format!("load state from {}", cfg.state_file.display()))?;
@@ -166,7 +167,7 @@ pub async fn run_daemon(cfg: DaemonConfig) -> Result<()> {
     // plus a Handle for cooperative shutdown that drains in-flight
     // requests up to a deadline.
     let handle = Handle::new();
-    spawn_shutdown_signal(handle.clone());
+    let _signal_task = spawn_signal_handler(handle.clone(), audit.clone());
 
     let tls = match (&cfg.tls_cert, &cfg.tls_key) {
         (Some(c), Some(k)) => Some(load_tls(c, k).await?),
@@ -207,30 +208,102 @@ async fn load_tls(cert: &Path, key: &Path) -> Result<RustlsConfig> {
         .with_context(|| format!("load TLS cert {} / key {}", cert.display(), key.display()))
 }
 
-fn spawn_shutdown_signal(handle: Handle<SocketAddr>) {
-    tokio::spawn(async move {
-        let ctrl_c = async {
-            let _ = tokio::signal::ctrl_c().await;
-        };
+struct SignalTask(tokio::task::JoinHandle<()>);
 
-        #[cfg(unix)]
-        let terminate = async {
-            if let Ok(mut sig) =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            {
-                sig.recv().await;
+impl Drop for SignalTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[cfg(unix)]
+fn spawn_signal_handler(handle: Handle<SocketAddr>, audit: AuditSink) -> SignalTask {
+    let mut interrupt =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(signal) => Some(signal),
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGINT handler");
+                None
             }
         };
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(signal) => Some(signal),
+            Err(error) => {
+                tracing::error!(%error, "failed to install SIGTERM handler");
+                None
+            }
+        };
+    let mut hangup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+        Ok(signal) => Some(signal),
+        Err(error) => {
+            tracing::error!(%error, "failed to install SIGHUP handler");
+            None
+        }
+    };
 
-        #[cfg(not(unix))]
-        let terminate = std::future::pending::<()>();
-
-        tokio::select! {
-            _ = ctrl_c => tracing::info!("received SIGINT, shutting down"),
-            _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    SignalTask(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                signal = recv_unix_signal(&mut interrupt) => {
+                    if signal.is_none() {
+                        tracing::error!("SIGINT signal stream closed");
+                        interrupt = None;
+                        continue;
+                    }
+                    tracing::info!("received SIGINT, shutting down");
+                    break;
+                }
+                signal = recv_unix_signal(&mut terminate) => {
+                    if signal.is_none() {
+                        tracing::error!("SIGTERM signal stream closed");
+                        terminate = None;
+                        continue;
+                    }
+                    tracing::info!("received SIGTERM, shutting down");
+                    break;
+                }
+                signal = recv_unix_signal(&mut hangup) => {
+                    if signal.is_none() {
+                        tracing::error!("SIGHUP signal stream closed");
+                        hangup = None;
+                        continue;
+                    }
+                    match audit.reopen() {
+                        Ok(()) => tracing::info!(
+                            audit_log = %audit.path().display(),
+                            "reopened audit log after SIGHUP"
+                        ),
+                        Err(error) => tracing::error!(
+                            %error,
+                            audit_log = %audit.path().display(),
+                            "failed to reopen audit log after SIGHUP"
+                        ),
+                    }
+                }
+            }
         }
         handle.graceful_shutdown(Some(Duration::from_secs(30)));
-    });
+    }))
+}
+
+#[cfg(unix)]
+async fn recv_unix_signal(signal: &mut Option<tokio::signal::unix::Signal>) -> Option<()> {
+    match signal {
+        Some(signal) => signal.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(not(unix))]
+fn spawn_signal_handler(handle: Handle<SocketAddr>, _audit: AuditSink) -> SignalTask {
+    SignalTask(tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => tracing::info!("received interrupt, shutting down"),
+            Err(error) => tracing::error!(%error, "interrupt handler failed"),
+        }
+        handle.graceful_shutdown(Some(Duration::from_secs(30)));
+    }))
 }
 
 /// Reject tokens that are empty, obvious placeholders, or below a minimum
