@@ -8,8 +8,8 @@
 //! of request handling stays parallel.
 //!
 //! Designed to be tailed by an external log shipper (vector, fluentbit).
-//! No rotation in-process — operators should plug in logrotate or run
-//! the daemon under a journal that handles size caps.
+//! Rotation is external: rename the file and send SIGHUP so the daemon
+//! atomically reopens the configured path without dropping records.
 use anyhow::{Context, Result};
 use axum::extract::Request;
 use axum::middleware::Next;
@@ -54,6 +54,39 @@ impl AuditSink {
 
     pub fn path(&self) -> &std::path::Path {
         &self.inner.path
+    }
+
+    /// Flush the current audit file and reopen the configured path.
+    ///
+    /// The writer lock is held across flush, open, and replacement, so a
+    /// concurrent request writes wholly to either the rotated file or the
+    /// new file. If opening the new path fails, the old writer remains in
+    /// place and callers can retry on the next SIGHUP.
+    pub fn reopen(&self) -> Result<()> {
+        let mut writer = self.inner.writer.lock();
+        writer
+            .flush()
+            .with_context(|| format!("flush audit log {}", self.inner.path.display()))?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.inner.path)
+            .with_context(|| format!("reopen audit log {}", self.inner.path.display()))?;
+        let mut replacement = BufWriter::new(file);
+        writeln!(
+            replacement,
+            "{}",
+            json!({
+                "ts": now_rfc3339(),
+                "event": "log_reopened",
+            })
+        )
+        .with_context(|| format!("write reopen event to {}", self.inner.path.display()))?;
+        replacement
+            .flush()
+            .with_context(|| format!("flush reopened audit log {}", self.inner.path.display()))?;
+        *writer = replacement;
+        Ok(())
     }
 
     pub fn write(&self, line: serde_json::Value) {
@@ -186,5 +219,47 @@ mod tests {
         assert!(lines.next().unwrap().contains("\"a\":1"));
         assert!(lines.next().unwrap().contains("\"a\":2"));
         assert!(lines.next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_sink_reopens_after_external_rotation() {
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("audit.log");
+        let rotated = td.path().join("audit.log.1");
+        let sink = AuditSink::open(&path).unwrap();
+
+        sink.write(json!({"before": true}));
+        std::fs::rename(&path, &rotated).unwrap();
+        sink.reopen().unwrap();
+        sink.write(json!({"after": true}));
+
+        let old_contents = std::fs::read_to_string(rotated).unwrap();
+        let new_contents = std::fs::read_to_string(path).unwrap();
+        assert!(old_contents.contains("\"before\":true"));
+        assert!(!old_contents.contains("\"after\":true"));
+        assert!(new_contents.contains("\"event\":\"log_reopened\""));
+        assert!(new_contents.contains("\"after\":true"));
+        assert!(!new_contents.contains("\"before\":true"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_sink_keeps_old_writer_when_reopen_fails() {
+        let td = tempfile::TempDir::new().unwrap();
+        let path = td.path().join("audit.log");
+        let rotated = td.path().join("audit.log.1");
+        let sink = AuditSink::open(&path).unwrap();
+
+        sink.write(json!({"before": true}));
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(sink.reopen().is_err());
+        sink.write(json!({"after_failed_reopen": true}));
+
+        let old_contents = std::fs::read_to_string(rotated).unwrap();
+        assert!(old_contents.contains("\"before\":true"));
+        assert!(old_contents.contains("\"after_failed_reopen\":true"));
     }
 }

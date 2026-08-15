@@ -76,8 +76,15 @@ Suggested alerts:
 {"ts":"2026-05-12T07:12:34Z","method":"POST","path":"/v1/sandboxes","status":201,"latency_us":98342,"ua":"forkd-cli/0.1"}
 ```
 
-Rotate with `logrotate`. The daemon reopens the file on `SIGHUP` is
-not yet implemented — for now, `systemctl restart` after a rotate.
+Rotate with `logrotate`. The packaged policy renames the current file,
+creates a new `0600` log, and runs `systemctl try-reload-or-restart
+forkd-controller`. The service maps reload to `SIGHUP`; the daemon flushes
+the old writer and atomically reopens the configured path without restarting
+or dropping in-flight requests. The `try-` variant safely falls back to a
+restart for an older installed service without reload support and does nothing
+when the service is inactive. A successful reopen writes a `log_reopened`
+event to the new file. For a manual rotation, send `systemctl reload
+forkd-controller` after moving the file.
 
 ---
 

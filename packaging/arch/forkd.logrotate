@@ -5,7 +5,10 @@
   delaycompress
   missingok
   notifempty
-  copytruncate
   su root root
   create 0600 root root
+  sharedscripts
+  postrotate
+    /usr/bin/systemctl try-reload-or-restart forkd-controller.service >/dev/null 2>&1 || true
+  endscript
 }

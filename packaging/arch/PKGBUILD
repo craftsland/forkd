@@ -35,7 +35,7 @@ source_x86_64=(
 sha256sums=(
   '86f7b7013dff87a69534190a231c8b3545c7365d123728002089e2b91eb8f7b4'
   '2aab38bae2a1d975281806a3f9bdb86fc1b59e40664438f238887e7b9e888cae'
-  '55aeede89ec62af51910487d7c9d583632b3a1973f36c53680fe7febb5320271'
+  'e7f34dfc8a32031ba897dd60452918ef8fa9118c1a17c51df8bb1b3764a92694'
 )
 sha256sums_x86_64=(
   '417865e0d9bb3fcaf6bd0308dfe8d40a4bd282adefb62459dd76585d6bede7e4'
@@ -86,9 +86,14 @@ check() {
   grep -Fqx '  delaycompress' "$srcdir/forkd.logrotate"
   grep -Fqx '  missingok' "$srcdir/forkd.logrotate"
   grep -Fqx '  notifempty' "$srcdir/forkd.logrotate"
-  grep -Fqx '  copytruncate' "$srcdir/forkd.logrotate"
   grep -Fqx '  su root root' "$srcdir/forkd.logrotate"
   grep -Fqx '  create 0600 root root' "$srcdir/forkd.logrotate"
+  grep -Fqx '  sharedscripts' "$srcdir/forkd.logrotate"
+  grep -Fqx '  postrotate' "$srcdir/forkd.logrotate"
+  grep -Fqx '    /usr/bin/systemctl try-reload-or-restart forkd-controller.service >/dev/null 2>&1 || true' \
+    "$srcdir/forkd.logrotate"
+  grep -Fqx '  endscript' "$srcdir/forkd.logrotate"
+  ! grep -Fq 'copytruncate' "$srcdir/forkd.logrotate"
 }
 
 package() {

@@ -11,6 +11,7 @@ ExecStart=/usr/local/bin/forkd-controller serve \
   --state /var/lib/forkd/state.json \
   --audit-log /var/log/forkd/audit.log \
   --token-file /etc/forkd/token
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=15s
